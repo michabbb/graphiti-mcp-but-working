@@ -1,0 +1,104 @@
+# Graphiti MCP Server - Docker Compose Configuration
+# This configuration supports both development and production deployments
+
+x-logging-settings: &default_logging
+  driver: json-file
+  options:
+    max-size: 10m
+    max-file: '3'
+
+services:
+  neo4j:
+    image: neo4j:5.26.2
+    logging: *default_logging
+    restart: always
+    expose:
+      - "7474" # HTTP
+      - "7687" # Bolt
+    # Uncomment for local development (direct access to Neo4j browser)
+    # ports:
+    #   - "127.0.0.1:7474:7474"
+    #   - "127.0.0.1:7687:7687"
+    environment:
+      - NEO4J_AUTH=${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD:-demodemo}
+      - NEO4J_server_memory_heap_initial__size=512m
+      - NEO4J_server_memory_heap_max__size=1G
+      - NEO4J_server_memory_pagecache_size=512m
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD", "wget", "-O", "/dev/null", "http://localhost:7474"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    labels:
+      - traefik.enable=false
+
+  graphiti-mcp:
+    image: graphiti-mcp:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    logging: *default_logging
+    restart: always
+    depends_on:
+      neo4j:
+        condition: service_healthy
+    networks:
+      - internal
+      # Uncomment 'web' network for production deployment with Traefik
+      # - web
+    expose:
+      - "8000" # Expose the MCP server via HTTP for SSE transport
+    # Uncomment for local development (direct access without reverse proxy)
+    # ports:
+    #   - "127.0.0.1:8000:8000"
+    environment:
+      # Neo4j Connection
+      - NEO4J_URI=${NEO4J_URI:-bolt://neo4j:7687}
+      - NEO4J_USER=${NEO4J_USER:-neo4j}
+      - NEO4J_PASSWORD=${NEO4J_PASSWORD:-demodemo}
+
+      # OpenAI Configuration
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - MODEL_NAME=${MODEL_NAME:-gpt-4.1-mini}
+
+      # Server Configuration
+      - PATH=/root/.local/bin:${PATH}
+      - SEMAPHORE_LIMIT=${SEMAPHORE_LIMIT:-10}
+      - GRAPHITI_TELEMETRY_ENABLED=false
+
+      # Authentication (optional but recommended for production)
+      # Generate secure tokens with: python3 -c "import secrets; print(secrets.token_hex(32))"
+      # Set multiple tokens separated by commas for different clients
+      - MCP_SERVER_NONCE_TOKENS=${MCP_SERVER_NONCE_TOKENS:-}
+      # Example with tokens (DO NOT use these in production!):
+      # - MCP_SERVER_NONCE_TOKENS=your-secret-token-here,another-token-here
+    command: ["uv", "run", "graphiti_mcp_server.py", "--transport", "sse"]
+
+    # Uncomment these labels for production deployment with Traefik reverse proxy
+    # Replace 'graphiti.mcp.example.com' with your actual domain
+    # labels:
+    #   - traefik.enable=true
+    #   - traefik.http.routers.graphitimcp.rule=Host(`graphiti.mcp.example.com`)
+    #   - traefik.http.routers.graphitimcp.tls=true
+    #   - traefik.http.routers.graphitimcp.tls.certresolver=leresolver
+    #   - traefik.http.services.graphitimcp.loadbalancer.server.port=8000
+
+volumes:
+  neo4j_data:
+  neo4j_logs:
+
+networks:
+  # Internal network for communication between services
+  internal:
+    external: false
+
+  # Uncomment for production deployment with Traefik
+  # External network for reverse proxy access
+  # web:
+  #   external: true
