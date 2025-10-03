@@ -413,7 +413,7 @@ Or add it to your `.env` file:
 GRAPHITI_TELEMETRY_ENABLED=false
 ```
 
-For complete details about what's collected and why, see the [Telemetry section in the main Graphiti README](../README.md#telemetry).
+For complete details about what's collected and why, see the [Telemetry section in the main Graphiti README](https://github.com/getzep/graphiti#telemetry).
 
 ## License
 
