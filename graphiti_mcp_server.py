@@ -5,6 +5,7 @@ Graphiti MCP Server - Exposes Graphiti functionality through the Model Context P
 
 import argparse
 import asyncio
+import contextvars
 import logging
 import os
 import secrets
@@ -56,6 +57,72 @@ DEFAULT_EMBEDDER_MODEL = 'text-embedding-3-small'
 # Decrease this if you're experiencing 429 rate limit errors from your LLM provider.
 # Increase if you have high rate limits.
 SEMAPHORE_LIMIT = int(os.getenv('SEMAPHORE_LIMIT', 10))
+
+# HTTP Header name for passing group_id
+# When this header is present in the request, its value will be used as the fixed group_id
+# and any group_id passed in tool call parameters will be ignored.
+GROUP_ID_HEADER_NAME = 'X-Group-Id'
+
+# Context variable to store the header-based group_id for the current request
+# This allows tool functions to access the header value without direct access to the HTTP request
+_header_group_id_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    'header_group_id', default=None
+)
+
+
+def get_header_group_id() -> str | None:
+    """Get the group_id from the HTTP header if it was set for the current request.
+    
+    Returns:
+        The group_id from the X-Group-Id header, or None if not set.
+    """
+    return _header_group_id_var.get()
+
+
+def set_header_group_id(group_id: str | None) -> contextvars.Token[str | None]:
+    """Set the group_id from the HTTP header for the current request context.
+    
+    Args:
+        group_id: The group_id value from the header, or None to clear it.
+        
+    Returns:
+        A token that can be used to reset the context variable.
+    """
+    return _header_group_id_var.set(group_id)
+
+
+def get_effective_group_id(
+    tool_group_id: str | None, 
+    default_group_id: str | None = None
+) -> str:
+    """Get the effective group_id to use for an operation.
+    
+    Priority order:
+    1. Header-based group_id (from X-Group-Id header) - highest priority, ignores tool parameter
+    2. Tool-provided group_id (from tool call parameters)
+    3. Default group_id (from CLI/config)
+    4. Empty string as fallback
+    
+    Args:
+        tool_group_id: The group_id passed in the tool call parameters.
+        default_group_id: The default group_id from config (usually from CLI --group-id).
+        
+    Returns:
+        The effective group_id to use for the operation.
+    """
+    # First check if a header-based group_id was set - this takes highest priority
+    header_group_id = get_header_group_id()
+    if header_group_id is not None:
+        return header_group_id
+    
+    # Otherwise, use tool-provided group_id or fall back to default
+    if tool_group_id is not None:
+        return tool_group_id
+    
+    if default_group_id is not None:
+        return default_group_id
+    
+    return ''
 
 
 class Requirement(BaseModel):
@@ -510,7 +577,7 @@ async def get_authenticated_principal(request: Request) -> dict[str, str]:
 
 
 class AuthenticationMiddleware:
-    """Pure ASGI middleware to enforce nonce token authentication.
+    """Pure ASGI middleware to enforce nonce token authentication and extract group_id header.
 
     This is a pure ASGI middleware (not BaseHTTPMiddleware) to avoid conflicts
     with SSE streaming responses.
@@ -518,10 +585,31 @@ class AuthenticationMiddleware:
     The nonce token must be provided as a query parameter on the FIRST request (/sse).
     Subsequent requests in the same session (like /messages/ and /register) are part of
     the authenticated session.
+    
+    Additionally, this middleware extracts the X-Group-Id header if present and stores it
+    in a context variable. When this header is present, any group_id passed in tool call
+    parameters will be ignored, and the header value will be used instead.
     """
 
     def __init__(self, app: ASGIApp):
         self.app = app
+
+    def _extract_header_group_id(self, scope: Scope) -> str | None:
+        """Extract the X-Group-Id header value from the request scope.
+        
+        Args:
+            scope: ASGI connection scope containing headers
+            
+        Returns:
+            The group_id from the X-Group-Id header, or None if not present.
+        """
+        headers = scope.get('headers', [])
+        # Headers are stored as list of tuples: [(name_bytes, value_bytes), ...]
+        header_name_lower = GROUP_ID_HEADER_NAME.lower().encode('latin-1')
+        for name, value in headers:
+            if name.lower() == header_name_lower:
+                return value.decode('latin-1')
+        return None
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         """ASGI middleware entry point.
@@ -543,38 +631,50 @@ class AuthenticationMiddleware:
         # Debug logging
         logger.debug(f'🔍 MIDDLEWARE CALLED: {method} {path}')
 
-        # Internal MCP endpoints that are part of an authenticated session
-        # These endpoints are called AFTER /sse authentication succeeds
-        internal_endpoints = ['/register', '/messages/', '/.well-known/']
+        # Extract and store the X-Group-Id header if present
+        header_group_id = self._extract_header_group_id(scope)
+        if header_group_id:
+            logger.info(f'🔑 X-Group-Id header found: {header_group_id}')
+        
+        # Set the context variable for the current request context
+        token = set_header_group_id(header_group_id)
+        
+        try:
+            # Internal MCP endpoints that are part of an authenticated session
+            # These endpoints are called AFTER /sse authentication succeeds
+            internal_endpoints = ['/register', '/messages/', '/.well-known/']
 
-        # Check if this is an internal endpoint (part of session, not initial auth)
-        is_internal = any(path.startswith(ep) for ep in internal_endpoints)
+            # Check if this is an internal endpoint (part of session, not initial auth)
+            is_internal = any(path.startswith(ep) for ep in internal_endpoints)
 
-        # Only authenticate the initial SSE connection (/sse)
-        # Internal endpoints are already protected by session management
-        if path == '/sse' or not is_internal:
-            # Build Request object for authentication
-            from starlette.requests import Request
-            request = Request(scope, receive)
+            # Only authenticate the initial SSE connection (/sse)
+            # Internal endpoints are already protected by session management
+            if path == '/sse' or not is_internal:
+                # Build Request object for authentication
+                from starlette.requests import Request
+                request = Request(scope, receive)
 
-            try:
-                # Authenticate the request
-                await get_authenticated_principal(request)
-            except HTTPException as exc:
-                # Return error response for authentication failures
-                logger.warning(f'🔍 MIDDLEWARE BLOCKED: {method} {path} - {exc.detail}')
+                try:
+                    # Authenticate the request
+                    await get_authenticated_principal(request)
+                except HTTPException as exc:
+                    # Return error response for authentication failures
+                    logger.warning(f'🔍 MIDDLEWARE BLOCKED: {method} {path} - {exc.detail}')
 
-                # Send 401 response directly via ASGI interface
-                response = PlainTextResponse(
-                    content=f'Error: {exc.detail}',
-                    status_code=exc.status_code,
-                    headers=exc.headers or {},
-                )
-                await response(scope, receive, send)
-                return
+                    # Send 401 response directly via ASGI interface
+                    response = PlainTextResponse(
+                        content=f'Error: {exc.detail}',
+                        status_code=exc.status_code,
+                        headers=exc.headers or {},
+                    )
+                    await response(scope, receive, send)
+                    return
 
-        # If authentication succeeds (or is internal endpoint), proceed
-        await self.app(scope, receive, send)
+            # If authentication succeeds (or is internal endpoint), proceed
+            await self.app(scope, receive, send)
+        finally:
+            # Reset the context variable after the request is done
+            _header_group_id_var.reset(token)
 
 
 # Create global config instance - will be properly initialized later
@@ -817,12 +917,16 @@ async def add_memory(
         elif source.lower() == 'json':
             source_type = EpisodeType.json
 
-        # Use the provided group_id or fall back to the default from config
-        effective_group_id = group_id if group_id is not None else config.group_id
-
-        # Cast group_id to str to satisfy type checker
-        # The Graphiti client expects a str for group_id, not Optional[str]
-        group_id_str = str(effective_group_id) if effective_group_id is not None else ''
+        # Use get_effective_group_id to determine the group_id
+        # Priority: Header X-Group-Id > tool parameter > config default
+        group_id_str = get_effective_group_id(group_id, config.group_id)
+        
+        # Log if header-based group_id is being used
+        header_group_id = get_header_group_id()
+        if header_group_id is not None and group_id is not None:
+            logger.info(
+                f"Header group_id '{header_group_id}' overriding tool parameter '{group_id}'"
+            )
 
         # We've already checked that graphiti_client is not None above
         # This assert statement helps type checkers understand that graphiti_client is defined
@@ -904,10 +1008,20 @@ async def search_memory_nodes(
         return ErrorResponse(error='Graphiti client not initialized')
 
     try:
-        # Use the provided group_ids or fall back to the default from config if none provided
-        effective_group_ids = (
-            group_ids if group_ids is not None else [config.group_id] if config.group_id else []
-        )
+        # Check for header-based group_id first - this takes highest priority
+        header_group_id = get_header_group_id()
+        if header_group_id is not None:
+            # Header group_id overrides any group_ids passed in tool parameters
+            if group_ids is not None:
+                logger.info(
+                    f"Header group_id '{header_group_id}' overriding tool parameter group_ids"
+                )
+            effective_group_ids = [header_group_id]
+        else:
+            # Use the provided group_ids or fall back to the default from config if none provided
+            effective_group_ids = (
+                group_ids if group_ids is not None else [config.group_id] if config.group_id else []
+            )
 
         # Configure the search
         if center_node_uuid is not None:
@@ -984,10 +1098,20 @@ async def search_memory_facts(
         if max_facts <= 0:
             return ErrorResponse(error='max_facts must be a positive integer')
 
-        # Use the provided group_ids or fall back to the default from config if none provided
-        effective_group_ids = (
-            group_ids if group_ids is not None else [config.group_id] if config.group_id else []
-        )
+        # Check for header-based group_id first - this takes highest priority
+        header_group_id = get_header_group_id()
+        if header_group_id is not None:
+            # Header group_id overrides any group_ids passed in tool parameters
+            if group_ids is not None:
+                logger.info(
+                    f"Header group_id '{header_group_id}' overriding tool parameter group_ids"
+                )
+            effective_group_ids = [header_group_id]
+        else:
+            # Use the provided group_ids or fall back to the default from config if none provided
+            effective_group_ids = (
+                group_ids if group_ids is not None else [config.group_id] if config.group_id else []
+            )
 
         # We've already checked that graphiti_client is not None above
         assert graphiti_client is not None
@@ -1163,11 +1287,19 @@ async def get_episodes(
         return ErrorResponse(error='Graphiti client not initialized')
 
     try:
-        # Use the provided group_id or fall back to the default from config
-        effective_group_id = group_id if group_id is not None else config.group_id
+        # Use get_effective_group_id to determine the group_id
+        # Priority: Header X-Group-Id > tool parameter > config default
+        effective_group_id = get_effective_group_id(group_id, config.group_id)
+        
+        # Log if header-based group_id is being used
+        header_group_id = get_header_group_id()
+        if header_group_id is not None and group_id is not None:
+            logger.info(
+                f"Header group_id '{header_group_id}' overriding tool parameter '{group_id}'"
+            )
 
-        if not isinstance(effective_group_id, str):
-            return ErrorResponse(error='Group ID must be a string')
+        if not effective_group_id:
+            return ErrorResponse(error='Group ID must be a non-empty string')
 
         # We've already checked that graphiti_client is not None above
         assert graphiti_client is not None

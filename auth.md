@@ -197,6 +197,26 @@ The authentication is implemented as **Starlette middleware** that intercepts HT
 3. Subsequent requests to `/messages/`, `/register` use the authenticated session
 4. No need to include nonce on every request after initial connection
 
+### X-Group-Id Header Support
+
+The middleware also supports extracting a `group_id` from the `X-Group-Id` HTTP header. When this header is present:
+
+- The header value becomes the **fixed group_id** for all tool calls in that request
+- Any `group_id` passed in tool call parameters will be **ignored**
+- This enables secure multi-tenant deployments where the group_id is set by the infrastructure
+
+**Example with both authentication and group_id:**
+```bash
+curl "http://localhost:8000/sse?nonce=your-token" \
+  -H "X-Group-Id: tenant-123"
+```
+
+**Priority order for group_id:**
+1. `X-Group-Id` header (highest priority)
+2. Tool parameter `group_id`
+3. CLI default `--group-id`
+4. Empty string (fallback)
+
 ### Constant-Time Comparison
 
 The implementation uses `secrets.compare_digest()` to prevent timing attacks when validating tokens. This ensures that token comparison takes the same amount of time regardless of whether the token matches or not.

@@ -290,6 +290,52 @@ The Graphiti MCP server exposes the following tools:
 - `clear_graph`: Clear all data from the knowledge graph and rebuild indices
 - `get_status`: Get the status of the Graphiti MCP server and Neo4j connection
 
+## Using the X-Group-Id Header
+
+When using SSE transport, you can pass a `group_id` via the `X-Group-Id` HTTP header. When this header is present, its value will be used as the fixed `group_id` for all tool calls in that request, and any `group_id` passed in tool call parameters will be ignored.
+
+This is useful for:
+- **Multi-tenant deployments**: Each client can send their tenant ID in the header, ensuring data isolation without relying on tool parameters
+- **API gateways**: Upstream proxies can inject the group_id header based on authentication/authorization
+- **Security**: The group_id cannot be overridden by the client's tool calls when set via header
+
+### Priority Order
+
+The `group_id` is determined in the following priority order:
+
+1. **X-Group-Id header** (highest priority) - if present, always used
+2. **Tool parameter** - if provided in the tool call
+3. **CLI default** - from `--group-id` argument
+4. **Empty string** - fallback
+
+### Example Usage
+
+```bash
+# Request with X-Group-Id header
+curl "http://localhost:8000/sse" \
+  -H "X-Group-Id: tenant-123" \
+  -H "Content-Type: application/json"
+```
+
+When the header is set to `tenant-123`, all tool calls in that session will use `tenant-123` as the group_id, regardless of what group_id is passed in the tool parameters.
+
+### MCP Client Configuration with Custom Headers
+
+If your MCP client supports custom headers, configure it like this:
+
+```json
+{
+  "mcpServers": {
+    "graphiti-memory": {
+      "url": "http://localhost:8000/sse",
+      "headers": {
+        "X-Group-Id": "my-tenant-id"
+      }
+    }
+  }
+}
+```
+
 ## Working with JSON Data
 
 The Graphiti MCP server can process structured JSON data through the `add_episode` tool with `source="json"`. This
