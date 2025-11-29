@@ -1298,8 +1298,8 @@ async def get_episodes(
                 f"Header group_id '{header_group_id}' overriding tool parameter '{group_id}'"
             )
 
-        if not effective_group_id:
-            return ErrorResponse(error='Group ID must be a non-empty string')
+        # Note: effective_group_id is always a string (get_effective_group_id returns str)
+        # Empty string is a valid group_id (fallback case)
 
         # We've already checked that graphiti_client is not None above
         assert graphiti_client is not None
