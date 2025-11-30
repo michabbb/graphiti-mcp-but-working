@@ -299,13 +299,27 @@ When using SSE transport, you can pass one or more `group_id` values via the `X-
 - **Single group_id in header**: Used as the fixed group_id for all tool calls (tool parameters are ignored)
 - **Multiple group_ids in header (comma-separated)**: Acts as an allowlist - only these group_ids are permitted
   - Tool parameters that match an allowed group_id are accepted
-  - Tool parameters not in the allowlist are rejected with an error
+  - Tool parameters not in the allowlist are rejected with an error message that shows which group_ids are allowed
   - If no tool parameter is provided, the first allowed group_id is used
 
 This is useful for:
 - **Multi-tenant deployments**: Each client can send their tenant ID(s) in the header, ensuring data isolation without relying on tool parameters
 - **API gateways**: Upstream proxies can inject the allowed group_ids based on authentication/authorization
 - **Security**: Clients cannot access group_ids not specified in the header allowlist
+
+### Error Messages
+
+When a tool call uses a group_id not in the allowlist, the error message includes the allowed group_ids:
+
+```
+group_id 'wrong-tenant' is not permitted. Allowed group_ids: ['tenant-a', 'tenant-b']
+```
+
+For tools that accept multiple group_ids:
+
+```
+Provided group_ids ['wrong1', 'wrong2'] are not permitted. Allowed group_ids: ['tenant-a', 'tenant-b']
+```
 
 ### Priority Order
 

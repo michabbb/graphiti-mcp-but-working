@@ -208,10 +208,15 @@ The middleware also supports extracting `group_id` values from the `X-Group-Id` 
 **Multiple group_ids (comma-separated):**
 - Only these group_ids are **permitted** for tool calls
 - Tool parameters that match an allowed group_id are accepted
-- Tool parameters not in the allowlist are **rejected** with an error
+- Tool parameters not in the allowlist are **rejected** with an error message showing the allowed group_ids
 - If no tool parameter is provided, the first allowed group_id is used
 
 This enables secure multi-tenant deployments where the allowed group_ids are set by the infrastructure.
+
+**Error messages** include the allowed group_ids when a request is rejected:
+```
+group_id 'wrong-tenant' is not permitted. Allowed group_ids: ['tenant-a', 'tenant-b']
+```
 
 **Example with single group_id:**
 ```bash
