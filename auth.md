@@ -199,23 +199,44 @@ The authentication is implemented as **Starlette middleware** that intercepts HT
 
 ### X-Group-Id Header Support
 
-The middleware also supports extracting a `group_id` from the `X-Group-Id` HTTP header. When this header is present:
+The middleware also supports extracting `group_id` values from the `X-Group-Id` HTTP header. The header supports comma-separated values which act as an **allowlist** for permitted group_ids.
 
-- The header value becomes the **fixed group_id** for all tool calls in that request
+**Single group_id:**
+- The header value becomes the **fixed group_id** for all tool calls
 - Any `group_id` passed in tool call parameters will be **ignored**
-- This enables secure multi-tenant deployments where the group_id is set by the infrastructure
 
-**Example with both authentication and group_id:**
+**Multiple group_ids (comma-separated):**
+- Only these group_ids are **permitted** for tool calls
+- Tool parameters that match an allowed group_id are accepted
+- Tool parameters not in the allowlist are **rejected** with an error
+- If no tool parameter is provided, the first allowed group_id is used
+
+This enables secure multi-tenant deployments where the allowed group_ids are set by the infrastructure.
+
+**Example with single group_id:**
 ```bash
 curl "http://localhost:8000/sse?nonce=your-token" \
   -H "X-Group-Id: tenant-123"
 ```
 
-**Priority order for group_id:**
-1. `X-Group-Id` header (highest priority)
-2. Tool parameter `group_id`
-3. CLI default `--group-id`
-4. Empty string (fallback)
+**Example with multiple allowed group_ids:**
+```bash
+curl "http://localhost:8000/sse?nonce=your-token" \
+  -H "X-Group-Id: tenant-a, tenant-b, tenant-c"
+```
+
+**Priority order with single group_id:**
+1. Header group_id is always used (tool parameter ignored)
+
+**Priority order with multiple group_ids (allowlist):**
+1. Tool parameter (if in allowlist)
+2. CLI default (if in allowlist)
+3. First entry in allowlist (fallback)
+
+**Priority order without header:**
+1. Tool parameter
+2. CLI default `--group-id`
+3. Empty string (fallback)
 
 ### Constant-Time Comparison
 

@@ -292,32 +292,51 @@ The Graphiti MCP server exposes the following tools:
 
 ## Using the X-Group-Id Header
 
-When using SSE transport, you can pass a `group_id` via the `X-Group-Id` HTTP header. When this header is present, its value will be used as the fixed `group_id` for all tool calls in that request, and any `group_id` passed in tool call parameters will be ignored.
+When using SSE transport, you can pass one or more `group_id` values via the `X-Group-Id` HTTP header. This header supports comma-separated values and acts as an **allowlist** for group_ids.
+
+### Behavior
+
+- **Single group_id in header**: Used as the fixed group_id for all tool calls (tool parameters are ignored)
+- **Multiple group_ids in header (comma-separated)**: Acts as an allowlist - only these group_ids are permitted
+  - Tool parameters that match an allowed group_id are accepted
+  - Tool parameters not in the allowlist are rejected with an error
+  - If no tool parameter is provided, the first allowed group_id is used
 
 This is useful for:
-- **Multi-tenant deployments**: Each client can send their tenant ID in the header, ensuring data isolation without relying on tool parameters
-- **API gateways**: Upstream proxies can inject the group_id header based on authentication/authorization
-- **Security**: The group_id cannot be overridden by the client's tool calls when set via header
+- **Multi-tenant deployments**: Each client can send their tenant ID(s) in the header, ensuring data isolation without relying on tool parameters
+- **API gateways**: Upstream proxies can inject the allowed group_ids based on authentication/authorization
+- **Security**: Clients cannot access group_ids not specified in the header allowlist
 
 ### Priority Order
 
-The `group_id` is determined in the following priority order:
+The `group_id` is determined based on the header configuration:
 
-1. **X-Group-Id header** (highest priority) - if present, always used
-2. **Tool parameter** - if provided in the tool call
-3. **CLI default** - from `--group-id` argument
-4. **Empty string** - fallback
+**With single group_id in header:**
+1. Header group_id is always used (tool parameter ignored)
+
+**With multiple group_ids in header (allowlist):**
+1. Tool parameter (if in allowlist)
+2. CLI default (if in allowlist)
+3. First entry in allowlist (fallback)
+
+**Without header:**
+1. Tool parameter
+2. CLI default (from `--group-id` argument)
+3. Empty string (fallback)
 
 ### Example Usage
 
 ```bash
-# Request with X-Group-Id header
+# Single group_id - always used
 curl "http://localhost:8000/sse" \
-  -H "X-Group-Id: tenant-123" \
-  -H "Content-Type: application/json"
+  -H "X-Group-Id: tenant-123"
+
+# Multiple group_ids (comma-separated) - acts as allowlist
+curl "http://localhost:8000/sse" \
+  -H "X-Group-Id: tenant-123, tenant-456, tenant-789"
 ```
 
-When the header is set to `tenant-123`, all tool calls in that session will use `tenant-123` as the group_id, regardless of what group_id is passed in the tool parameters.
+When the header contains `tenant-123, tenant-456, tenant-789`, tool calls can only use one of these three group_ids. Any attempt to use a different group_id will be rejected.
 
 ### MCP Client Configuration with Custom Headers
 
@@ -329,7 +348,7 @@ If your MCP client supports custom headers, configure it like this:
     "graphiti-memory": {
       "url": "http://localhost:8000/sse",
       "headers": {
-        "X-Group-Id": "my-tenant-id"
+        "X-Group-Id": "tenant-a, tenant-b"
       }
     }
   }

@@ -58,71 +58,151 @@ DEFAULT_EMBEDDER_MODEL = 'text-embedding-3-small'
 # Increase if you have high rate limits.
 SEMAPHORE_LIMIT = int(os.getenv('SEMAPHORE_LIMIT', 10))
 
-# HTTP Header name for passing group_id
-# When this header is present in the request, its value will be used as the fixed group_id
-# and any group_id passed in tool call parameters will be ignored.
+# HTTP Header name for passing allowed group_ids
+# When this header is present in the request, its value(s) define the allowed group_ids.
+# Multiple group_ids can be provided as comma-separated values.
+# Only these group_ids will be permitted for tool calls - any other group_id will be rejected.
 GROUP_ID_HEADER_NAME = 'X-Group-Id'
 
-# Context variable to store the header-based group_id for the current request
-# This allows tool functions to access the header value without direct access to the HTTP request
-_header_group_id_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
-    'header_group_id', default=None
+# Context variable to store the allowed group_ids from the header for the current request
+# This allows tool functions to access the header values without direct access to the HTTP request
+# When set, this acts as an allowlist - only group_ids in this list are permitted
+_allowed_group_ids_var: contextvars.ContextVar[list[str] | None] = contextvars.ContextVar(
+    'allowed_group_ids', default=None
 )
 
 
-def get_header_group_id() -> str | None:
-    """Get the group_id from the HTTP header if it was set for the current request.
+def get_allowed_group_ids() -> list[str] | None:
+    """Get the allowed group_ids from the HTTP header if set for the current request.
     
     Returns:
-        The group_id from the X-Group-Id header, or None if not set.
+        List of allowed group_ids from the X-Group-Id header, or None if not set.
     """
-    return _header_group_id_var.get()
+    return _allowed_group_ids_var.get()
 
 
-def set_header_group_id(group_id: str | None) -> contextvars.Token[str | None]:
-    """Set the group_id from the HTTP header for the current request context.
+def set_allowed_group_ids(group_ids: list[str] | None) -> contextvars.Token[list[str] | None]:
+    """Set the allowed group_ids from the HTTP header for the current request context.
     
     Args:
-        group_id: The group_id value from the header, or None to clear it.
+        group_ids: List of allowed group_id values from the header, or None to clear.
         
     Returns:
         A token that can be used to reset the context variable.
     """
-    return _header_group_id_var.set(group_id)
+    return _allowed_group_ids_var.set(group_ids)
+
+
+def is_group_id_allowed(group_id: str) -> bool:
+    """Check if a group_id is allowed based on the header allowlist.
+    
+    Args:
+        group_id: The group_id to check.
+        
+    Returns:
+        True if the group_id is allowed (or no allowlist is set), False otherwise.
+    """
+    allowed = get_allowed_group_ids()
+    if allowed is None:
+        # No allowlist set, all group_ids are allowed
+        return True
+    return group_id in allowed
 
 
 def get_effective_group_id(
     tool_group_id: str | None, 
     default_group_id: str | None = None
-) -> str:
-    """Get the effective group_id to use for an operation.
+) -> str | None:
+    """Get the effective group_id to use for an operation, respecting the header allowlist.
     
-    Priority order:
-    1. Header-based group_id (from X-Group-Id header) - highest priority, ignores tool parameter
-    2. Tool-provided group_id (from tool call parameters)
-    3. Default group_id (from CLI/config)
-    4. Empty string as fallback
+    Behavior:
+    - If X-Group-Id header is set with one or more group_ids, these act as an allowlist
+    - If only one group_id is in the allowlist, it is used as the fixed group_id
+    - If multiple group_ids are in the allowlist, the tool parameter must be in the list
+    - If the tool parameter is not in the allowlist, returns None (rejected)
+    
+    Priority order (when allowlist has multiple entries):
+    1. Tool-provided group_id (must be in allowlist)
+    2. Default group_id (must be in allowlist)
+    3. First entry in allowlist as fallback
     
     Args:
         tool_group_id: The group_id passed in the tool call parameters.
         default_group_id: The default group_id from config (usually from CLI --group-id).
         
     Returns:
-        The effective group_id to use for the operation.
+        The effective group_id to use for the operation, or None if rejected.
     """
-    # First check if a header-based group_id was set - this takes highest priority
-    header_group_id = get_header_group_id()
-    if header_group_id is not None:
-        return header_group_id
+    allowed = get_allowed_group_ids()
     
-    # Otherwise, use tool-provided group_id or fall back to default
+    if allowed is None:
+        # No allowlist set - use original priority: tool param > default > empty string
+        if tool_group_id is not None:
+            return tool_group_id
+        if default_group_id is not None:
+            return default_group_id
+        return ''
+    
+    # Allowlist is set
+    if len(allowed) == 1:
+        # Single entry in allowlist - use it as fixed group_id, ignore tool parameter
+        return allowed[0]
+    
+    # Multiple entries in allowlist - tool parameter must be validated
     if tool_group_id is not None:
-        return tool_group_id
+        if tool_group_id in allowed:
+            return tool_group_id
+        else:
+            # Tool parameter not in allowlist - rejected
+            return None
     
-    if default_group_id is not None:
+    # No tool parameter provided
+    if default_group_id is not None and default_group_id in allowed:
         return default_group_id
     
-    return ''
+    # Fall back to first entry in allowlist
+    return allowed[0]
+
+
+def get_effective_group_ids(
+    tool_group_ids: list[str] | None,
+    default_group_id: str | None = None
+) -> list[str] | None:
+    """Get the effective group_ids to use for search operations, respecting the header allowlist.
+    
+    Behavior:
+    - If X-Group-Id header is set, only group_ids in the allowlist are permitted
+    - If tool provides group_ids, they are filtered to only include allowed ones
+    - If the result would be empty (all tool group_ids rejected), returns None
+    
+    Args:
+        tool_group_ids: List of group_ids passed in the tool call parameters.
+        default_group_id: The default group_id from config (usually from CLI --group-id).
+        
+    Returns:
+        List of effective group_ids to use, or None if all were rejected.
+    """
+    allowed = get_allowed_group_ids()
+    
+    if allowed is None:
+        # No allowlist set - use original behavior
+        if tool_group_ids is not None:
+            return tool_group_ids
+        if default_group_id is not None:
+            return [default_group_id]
+        return []
+    
+    # Allowlist is set
+    if tool_group_ids is not None:
+        # Filter tool_group_ids to only include allowed ones
+        filtered = [gid for gid in tool_group_ids if gid in allowed]
+        if not filtered:
+            # All provided group_ids were rejected
+            return None
+        return filtered
+    
+    # No tool group_ids provided - use the full allowlist
+    return allowed
 
 
 class Requirement(BaseModel):
@@ -587,28 +667,33 @@ class AuthenticationMiddleware:
     the authenticated session.
     
     Additionally, this middleware extracts the X-Group-Id header if present and stores it
-    in a context variable. When this header is present, any group_id passed in tool call
-    parameters will be ignored, and the header value will be used instead.
+    in a context variable. The header can contain multiple comma-separated group_ids which
+    act as an allowlist - only these group_ids will be permitted for tool calls.
     """
 
     def __init__(self, app: ASGIApp):
         self.app = app
 
-    def _extract_header_group_id(self, scope: Scope) -> str | None:
-        """Extract the X-Group-Id header value from the request scope.
+    def _extract_allowed_group_ids(self, scope: Scope) -> list[str] | None:
+        """Extract the X-Group-Id header value(s) from the request scope.
+        
+        The header can contain multiple comma-separated group_ids which act as an allowlist.
         
         Args:
             scope: ASGI connection scope containing headers
             
         Returns:
-            The group_id from the X-Group-Id header, or None if not present.
+            List of allowed group_ids from the X-Group-Id header, or None if not present.
         """
         headers = scope.get('headers', [])
         # Headers are stored as list of tuples: [(name_bytes, value_bytes), ...]
         header_name_lower = GROUP_ID_HEADER_NAME.lower().encode('latin-1')
         for name, value in headers:
             if name.lower() == header_name_lower:
-                return value.decode('latin-1')
+                header_value = value.decode('latin-1')
+                # Parse comma-separated values and strip whitespace
+                group_ids = [gid.strip() for gid in header_value.split(',') if gid.strip()]
+                return group_ids if group_ids else None
         return None
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
@@ -631,13 +716,13 @@ class AuthenticationMiddleware:
         # Debug logging
         logger.debug(f'🔍 MIDDLEWARE CALLED: {method} {path}')
 
-        # Extract and store the X-Group-Id header if present
-        header_group_id = self._extract_header_group_id(scope)
-        if header_group_id:
-            logger.info(f'🔑 X-Group-Id header found: {header_group_id}')
+        # Extract and store the X-Group-Id header if present (supports comma-separated values)
+        allowed_group_ids = self._extract_allowed_group_ids(scope)
+        if allowed_group_ids:
+            logger.info(f'🔑 X-Group-Id header found with allowed group_ids: {allowed_group_ids}')
         
         # Set the context variable for the current request context
-        token = set_header_group_id(header_group_id)
+        token = set_allowed_group_ids(allowed_group_ids)
         
         try:
             # Internal MCP endpoints that are part of an authenticated session
@@ -674,7 +759,7 @@ class AuthenticationMiddleware:
             await self.app(scope, receive, send)
         finally:
             # Reset the context variable after the request is done
-            _header_group_id_var.reset(token)
+            _allowed_group_ids_var.reset(token)
 
 
 # Create global config instance - will be properly initialized later
@@ -917,15 +1002,20 @@ async def add_memory(
         elif source.lower() == 'json':
             source_type = EpisodeType.json
 
-        # Use get_effective_group_id to determine the group_id
-        # Priority: Header X-Group-Id > tool parameter > config default
+        # Use get_effective_group_id to determine the group_id, respecting the header allowlist
         group_id_str = get_effective_group_id(group_id, config.group_id)
         
-        # Log if header-based group_id is being used
-        header_group_id = get_header_group_id()
-        if header_group_id is not None and group_id is not None:
+        # Check if the group_id was rejected (not in allowlist)
+        if group_id_str is None:
+            return ErrorResponse(
+                error=f"group_id '{group_id}' is not permitted"
+            )
+        
+        # Log if header-based allowlist is being used
+        allowed = get_allowed_group_ids()
+        if allowed is not None and group_id is not None and group_id != group_id_str:
             logger.info(
-                f"Header group_id '{header_group_id}' overriding tool parameter '{group_id}'"
+                f"Using group_id '{group_id_str}' from allowlist (tool parameter '{group_id}' was overridden)"
             )
 
         # We've already checked that graphiti_client is not None above
@@ -1008,20 +1098,23 @@ async def search_memory_nodes(
         return ErrorResponse(error='Graphiti client not initialized')
 
     try:
-        # Check for header-based group_id first - this takes highest priority
-        header_group_id = get_header_group_id()
-        if header_group_id is not None:
-            # Header group_id overrides any group_ids passed in tool parameters
-            if group_ids is not None:
-                logger.info(
-                    f"Header group_id '{header_group_id}' overriding tool parameter group_ids"
-                )
-            effective_group_ids = [header_group_id]
-        else:
-            # Use the provided group_ids or fall back to the default from config if none provided
-            effective_group_ids = (
-                group_ids if group_ids is not None else [config.group_id] if config.group_id else []
+        # Use get_effective_group_ids to determine allowed group_ids, respecting the header allowlist
+        effective_group_ids = get_effective_group_ids(group_ids, config.group_id)
+        
+        # Check if all provided group_ids were rejected (not in allowlist)
+        if effective_group_ids is None:
+            return ErrorResponse(
+                error=f"Provided group_ids are not permitted"
             )
+        
+        # Log if header-based allowlist is filtering the group_ids
+        allowed = get_allowed_group_ids()
+        if allowed is not None and group_ids is not None:
+            filtered_out = [gid for gid in group_ids if gid not in allowed]
+            if filtered_out:
+                logger.info(
+                    f"Filtered out group_ids not in allowlist: {filtered_out}"
+                )
 
         # Configure the search
         if center_node_uuid is not None:
@@ -1098,20 +1191,23 @@ async def search_memory_facts(
         if max_facts <= 0:
             return ErrorResponse(error='max_facts must be a positive integer')
 
-        # Check for header-based group_id first - this takes highest priority
-        header_group_id = get_header_group_id()
-        if header_group_id is not None:
-            # Header group_id overrides any group_ids passed in tool parameters
-            if group_ids is not None:
-                logger.info(
-                    f"Header group_id '{header_group_id}' overriding tool parameter group_ids"
-                )
-            effective_group_ids = [header_group_id]
-        else:
-            # Use the provided group_ids or fall back to the default from config if none provided
-            effective_group_ids = (
-                group_ids if group_ids is not None else [config.group_id] if config.group_id else []
+        # Use get_effective_group_ids to determine allowed group_ids, respecting the header allowlist
+        effective_group_ids = get_effective_group_ids(group_ids, config.group_id)
+        
+        # Check if all provided group_ids were rejected (not in allowlist)
+        if effective_group_ids is None:
+            return ErrorResponse(
+                error=f"Provided group_ids are not permitted"
             )
+        
+        # Log if header-based allowlist is filtering the group_ids
+        allowed = get_allowed_group_ids()
+        if allowed is not None and group_ids is not None:
+            filtered_out = [gid for gid in group_ids if gid not in allowed]
+            if filtered_out:
+                logger.info(
+                    f"Filtered out group_ids not in allowlist: {filtered_out}"
+                )
 
         # We've already checked that graphiti_client is not None above
         assert graphiti_client is not None
@@ -1287,19 +1383,21 @@ async def get_episodes(
         return ErrorResponse(error='Graphiti client not initialized')
 
     try:
-        # Use get_effective_group_id to determine the group_id
-        # Priority: Header X-Group-Id > tool parameter > config default
+        # Use get_effective_group_id to determine the group_id, respecting the header allowlist
         effective_group_id = get_effective_group_id(group_id, config.group_id)
         
-        # Log if header-based group_id is being used
-        header_group_id = get_header_group_id()
-        if header_group_id is not None and group_id is not None:
-            logger.info(
-                f"Header group_id '{header_group_id}' overriding tool parameter '{group_id}'"
+        # Check if the group_id was rejected (not in allowlist)
+        if effective_group_id is None:
+            return ErrorResponse(
+                error=f"group_id '{group_id}' is not permitted"
             )
-
-        # Note: effective_group_id is always a string (get_effective_group_id returns str)
-        # Empty string is a valid group_id (fallback case)
+        
+        # Log if header-based allowlist is being used
+        allowed = get_allowed_group_ids()
+        if allowed is not None and group_id is not None and group_id != effective_group_id:
+            logger.info(
+                f"Using group_id '{effective_group_id}' from allowlist (tool parameter '{group_id}' was overridden)"
+            )
 
         # We've already checked that graphiti_client is not None above
         assert graphiti_client is not None
