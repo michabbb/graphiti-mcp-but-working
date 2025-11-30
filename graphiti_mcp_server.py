@@ -1007,8 +1007,9 @@ async def add_memory(
         
         # Check if the group_id was rejected (not in allowlist)
         if group_id_str is None:
+            allowed = get_allowed_group_ids()
             return ErrorResponse(
-                error=f"group_id '{group_id}' is not permitted"
+                error=f"group_id '{group_id}' is not permitted. Allowed group_ids: {allowed}"
             )
         
         # Log if header-based allowlist is being used
@@ -1103,8 +1104,9 @@ async def search_memory_nodes(
         
         # Check if all provided group_ids were rejected (not in allowlist)
         if effective_group_ids is None:
+            allowed = get_allowed_group_ids()
             return ErrorResponse(
-                error=f"Provided group_ids are not permitted"
+                error=f"Provided group_ids {group_ids} are not permitted. Allowed group_ids: {allowed}"
             )
         
         # Log if header-based allowlist is filtering the group_ids
@@ -1196,8 +1198,9 @@ async def search_memory_facts(
         
         # Check if all provided group_ids were rejected (not in allowlist)
         if effective_group_ids is None:
+            allowed = get_allowed_group_ids()
             return ErrorResponse(
-                error=f"Provided group_ids are not permitted"
+                error=f"Provided group_ids {group_ids} are not permitted. Allowed group_ids: {allowed}"
             )
         
         # Log if header-based allowlist is filtering the group_ids
@@ -1388,8 +1391,9 @@ async def get_episodes(
         
         # Check if the group_id was rejected (not in allowlist)
         if effective_group_id is None:
+            allowed = get_allowed_group_ids()
             return ErrorResponse(
-                error=f"group_id '{group_id}' is not permitted"
+                error=f"group_id '{group_id}' is not permitted. Allowed group_ids: {allowed}"
             )
         
         # Log if header-based allowlist is being used
