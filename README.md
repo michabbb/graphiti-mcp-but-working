@@ -17,11 +17,12 @@ This enhanced version includes several important improvements over the original 
 
 1. **🚀 Latest Graphiti Core Compatibility** - Uses the current version of graphiti-core with all latest features and improvements
 2. **🤖 GPT-5, O1, O3 Model Support** - Proper handling of OpenAI's reasoning models with automatic parameter adjustment (disables temperature, reasoning, and verbosity parameters)
-3. **🔒 Token-Based Authentication** - Production-ready nonce token authentication system enabling secure public deployment via SSE transport
+3. **🔒 Token-Based Authentication** - Production-ready nonce token authentication system enabling secure public deployment
 4. **📊 New `list_group_ids` Tool** - Discover and manage all group IDs across nodes and relationships in your knowledge graph
 5. **🛡️ Enhanced Security** - Pure ASGI middleware-based authentication with constant-time token comparison to prevent timing attacks
 6. **🔇 Telemetry Control** - Automatic disabling of telemetry for privacy-focused deployments (set before graphiti_core imports)
 7. **⚡ Simplified Dependencies** - Removed Azure OpenAI dependencies for easier setup and deployment
+8. **🌐 MCP 2025-06-18 Support** - Uses the new Streamable HTTP transport standard (with SSE fallback for legacy clients)
 
 ### About Azure Support
 
@@ -69,7 +70,7 @@ pwd
 
 3. Configure Claude, Cursor, or other MCP client to use [Graphiti with a `stdio` transport](#integrating-with-mcp-clients). See the client documentation on where to find their MCP configuration files.
 
-### For Cursor and other `sse`-enabled clients (Recommended)
+### For Cursor and other HTTP-enabled clients (Recommended)
 
 1. Configure your environment variables (copy `.env.example` to `.env` and set your `OPENAI_API_KEY`)
 
@@ -79,7 +80,9 @@ pwd
 docker compose up
 ```
 
-3. Point your MCP client to `http://localhost:8000/sse`
+3. Point your MCP client to:
+   - `http://localhost:8000/mcp` (Streamable HTTP - **MCP 2025-06-18 standard, recommended**)
+   - `http://localhost:8000/sse` (Legacy SSE transport, for older clients)
 
 **For secure public deployment**, see the [Authentication Guide](auth.md) for setting up nonce token authentication.
 
@@ -139,6 +142,10 @@ uv run graphiti_mcp_server.py
 With options:
 
 ```bash
+# Using the new Streamable HTTP transport (default, MCP 2025-06-18 standard)
+uv run graphiti_mcp_server.py --model gpt-4.1-mini --transport streamable-http
+
+# Using legacy SSE transport (for older clients)
 uv run graphiti_mcp_server.py --model gpt-4.1-mini --transport sse
 ```
 
@@ -147,7 +154,10 @@ Available arguments:
 - `--model`: Overrides the `MODEL_NAME` environment variable.
 - `--small-model`: Overrides the `SMALL_MODEL_NAME` environment variable.
 - `--temperature`: Overrides the `LLM_TEMPERATURE` environment variable.
-- `--transport`: Choose the transport method (sse or stdio, default: sse)
+- `--transport`: Choose the transport method:
+  - `streamable-http` (default): New MCP 2025-06-18 standard, endpoint at `/mcp`
+  - `sse`: Legacy SSE transport, endpoint at `/sse`
+  - `stdio`: Standard I/O transport for local processes
 - `--group-id`: Set a namespace for the graph (optional). If not provided, defaults to "default".
 - `--destroy-graph`: If set, destroys all Graphiti graphs on startup.
 - `--use-custom-entities`: Enable entity extraction using the predefined ENTITY_TYPES
@@ -220,7 +230,9 @@ This will start both the Neo4j database and the Graphiti MCP server. The Docker 
 - Uses `uv` for package management and running the server
 - Installs dependencies from the `pyproject.toml` file
 - Connects to the Neo4j container using the environment variables
-- Exposes the server on port 8000 for HTTP-based SSE transport
+- Exposes the server on port 8000 with both transports:
+  - `/mcp` - Streamable HTTP transport (MCP 2025-06-18 standard)
+  - `/sse` - Legacy SSE transport (for older clients)
 - Includes a healthcheck for Neo4j to ensure it's fully operational before starting the MCP server
 
 ## Integrating with MCP Clients
@@ -263,7 +275,20 @@ To use the Graphiti MCP server with an MCP-compatible client, configure it to co
 }
 ```
 
-For SSE transport (HTTP-based), you can use this configuration:
+For Streamable HTTP transport (MCP 2025-06-18 standard, recommended):
+
+```json
+{
+  "mcpServers": {
+    "graphiti-memory": {
+      "transport": "streamable-http",
+      "url": "http://localhost:8000/mcp"
+    }
+  }
+}
+```
+
+For legacy SSE transport (HTTP-based):
 
 ```json
 {
@@ -290,6 +315,90 @@ The Graphiti MCP server exposes the following tools:
 - `clear_graph`: Clear all data from the knowledge graph and rebuild indices
 - `get_status`: Get the status of the Graphiti MCP server and Neo4j connection
 
+## Using the X-Group-Id Header
+
+When using HTTP-based transports (Streamable HTTP or SSE), you can pass one or more `group_id` values via the `X-Group-Id` HTTP header. This header supports comma-separated values and acts as an **allowlist** for group_ids.
+
+### Behavior
+
+- **Single group_id in header**: Used as the fixed group_id for all tool calls (tool parameters are ignored)
+- **Multiple group_ids in header (comma-separated)**: Acts as an allowlist - only these group_ids are permitted
+  - Tool parameters that match an allowed group_id are accepted
+  - Tool parameters not in the allowlist are rejected with an error message that shows which group_ids are allowed
+  - If no tool parameter is provided, the first allowed group_id is used
+
+This is useful for:
+- **Multi-tenant deployments**: Each client can send their tenant ID(s) in the header, ensuring data isolation without relying on tool parameters
+- **API gateways**: Upstream proxies can inject the allowed group_ids based on authentication/authorization
+- **Security**: Clients cannot access group_ids not specified in the header allowlist
+
+### Error Messages
+
+When a tool call uses a group_id not in the allowlist, the error message includes the allowed group_ids:
+
+```
+group_id 'wrong-tenant' is not permitted. Allowed group_ids: ['tenant-a', 'tenant-b']
+```
+
+For tools that accept multiple group_ids:
+
+```
+Provided group_ids ['wrong1', 'wrong2'] are not permitted. Allowed group_ids: ['tenant-a', 'tenant-b']
+```
+
+### Priority Order
+
+The `group_id` is determined based on the header configuration:
+
+**With single group_id in header:**
+1. Header group_id is always used (tool parameter ignored)
+
+**With multiple group_ids in header (allowlist):**
+1. Tool parameter (if in allowlist)
+2. CLI default (if in allowlist)
+3. First entry in allowlist (fallback)
+
+**Without header:**
+1. Tool parameter
+2. CLI default (from `--group-id` argument)
+3. Empty string (fallback)
+
+### Example Usage
+
+```bash
+# Using Streamable HTTP transport (MCP 2025-06-18)
+# Single group_id - always used
+curl "http://localhost:8000/mcp" \
+  -H "X-Group-Id: tenant-123"
+
+# Multiple group_ids (comma-separated) - acts as allowlist
+curl "http://localhost:8000/mcp" \
+  -H "X-Group-Id: tenant-123, tenant-456, tenant-789"
+
+# Using legacy SSE transport
+curl "http://localhost:8000/sse" \
+  -H "X-Group-Id: tenant-123"
+```
+
+When the header contains `tenant-123, tenant-456, tenant-789`, tool calls can only use one of these three group_ids. Any attempt to use a different group_id will be rejected.
+
+### MCP Client Configuration with Custom Headers
+
+If your MCP client supports custom headers, configure it like this:
+
+```json
+{
+  "mcpServers": {
+    "graphiti-memory": {
+      "url": "http://localhost:8000/mcp",
+      "headers": {
+        "X-Group-Id": "tenant-a, tenant-b"
+      }
+    }
+  }
+}
+```
+
 ## Working with JSON Data
 
 The Graphiti MCP server can process structured JSON data through the `add_episode` tool with `source="json"`. This
@@ -310,9 +419,13 @@ source_description="CRM data"
 
 To integrate the Graphiti MCP Server with the Cursor IDE, follow these steps:
 
-1. Run the Graphiti MCP server using the SSE transport:
+1. Run the Graphiti MCP server:
 
 ```bash
+# Using Streamable HTTP transport (MCP 2025-06-18 standard, recommended)
+python graphiti_mcp_server.py --transport streamable-http --use-custom-entities --group-id <your_group_id>
+
+# Or using legacy SSE transport
 python graphiti_mcp_server.py --transport sse --use-custom-entities --group-id <your_group_id>
 ```
 
@@ -330,11 +443,13 @@ docker compose up
 {
   "mcpServers": {
     "graphiti-memory": {
-      "url": "http://localhost:8000/sse"
+      "url": "http://localhost:8000/mcp"
     }
   }
 }
 ```
+
+For legacy SSE transport, use `http://localhost:8000/sse` instead.
 
 3. Add the Graphiti rules to Cursor's User Rules. See [cursor_rules.md](cursor_rules.md) for details.
 
@@ -345,9 +460,9 @@ capabilities.
 
 ## Integrating with Claude Desktop (Docker MCP Server)
 
-The Graphiti MCP Server container uses the SSE MCP transport. Claude Desktop does not natively support SSE, so you'll need to use a gateway like `mcp-remote`.
+The Graphiti MCP Server container supports both Streamable HTTP (MCP 2025-06-18) and legacy SSE transports. Claude Desktop may require a gateway like `mcp-remote` for HTTP-based transports.
 
-1.  **Run the Graphiti MCP server using SSE transport**:
+1.  **Run the Graphiti MCP server**:
 
     ```bash
     docker compose up
@@ -371,7 +486,7 @@ The Graphiti MCP Server container uses the SSE MCP transport. Claude Desktop doe
           "command": "npx", // Or the full path to mcp-remote if npx is not in your PATH
           "args": [
             "mcp-remote",
-            "http://localhost:8000/sse" // Ensure this matches your Graphiti server's SSE endpoint
+            "http://localhost:8000/mcp" // Use /mcp for Streamable HTTP or /sse for legacy SSE
           ]
         }
       }

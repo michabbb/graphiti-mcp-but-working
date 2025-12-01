@@ -5,6 +5,7 @@ Graphiti MCP Server - Exposes Graphiti functionality through the Model Context P
 
 import argparse
 import asyncio
+import contextvars
 import logging
 import os
 import secrets
@@ -56,6 +57,152 @@ DEFAULT_EMBEDDER_MODEL = 'text-embedding-3-small'
 # Decrease this if you're experiencing 429 rate limit errors from your LLM provider.
 # Increase if you have high rate limits.
 SEMAPHORE_LIMIT = int(os.getenv('SEMAPHORE_LIMIT', 10))
+
+# HTTP Header name for passing allowed group_ids
+# When this header is present in the request, its value(s) define the allowed group_ids.
+# Multiple group_ids can be provided as comma-separated values.
+# Only these group_ids will be permitted for tool calls - any other group_id will be rejected.
+GROUP_ID_HEADER_NAME = 'X-Group-Id'
+
+# Context variable to store the allowed group_ids from the header for the current request
+# This allows tool functions to access the header values without direct access to the HTTP request
+# When set, this acts as an allowlist - only group_ids in this list are permitted
+_allowed_group_ids_var: contextvars.ContextVar[list[str] | None] = contextvars.ContextVar(
+    'allowed_group_ids', default=None
+)
+
+
+def get_allowed_group_ids() -> list[str] | None:
+    """Get the allowed group_ids from the HTTP header if set for the current request.
+    
+    Returns:
+        List of allowed group_ids from the X-Group-Id header, or None if not set.
+    """
+    return _allowed_group_ids_var.get()
+
+
+def set_allowed_group_ids(group_ids: list[str] | None) -> contextvars.Token[list[str] | None]:
+    """Set the allowed group_ids from the HTTP header for the current request context.
+    
+    Args:
+        group_ids: List of allowed group_id values from the header, or None to clear.
+        
+    Returns:
+        A token that can be used to reset the context variable.
+    """
+    return _allowed_group_ids_var.set(group_ids)
+
+
+def is_group_id_allowed(group_id: str) -> bool:
+    """Check if a group_id is allowed based on the header allowlist.
+    
+    Args:
+        group_id: The group_id to check.
+        
+    Returns:
+        True if the group_id is allowed (or no allowlist is set), False otherwise.
+    """
+    allowed = get_allowed_group_ids()
+    if allowed is None:
+        # No allowlist set, all group_ids are allowed
+        return True
+    return group_id in allowed
+
+
+def get_effective_group_id(
+    tool_group_id: str | None, 
+    default_group_id: str | None = None
+) -> str | None:
+    """Get the effective group_id to use for an operation, respecting the header allowlist.
+    
+    Behavior:
+    - If X-Group-Id header is set with one or more group_ids, these act as an allowlist
+    - If only one group_id is in the allowlist, it is used as the fixed group_id
+    - If multiple group_ids are in the allowlist, the tool parameter must be in the list
+    - If the tool parameter is not in the allowlist, returns None (rejected)
+    
+    Priority order (when allowlist has multiple entries):
+    1. Tool-provided group_id (must be in allowlist)
+    2. Default group_id (must be in allowlist)
+    3. First entry in allowlist as fallback
+    
+    Args:
+        tool_group_id: The group_id passed in the tool call parameters.
+        default_group_id: The default group_id from config (usually from CLI --group-id).
+        
+    Returns:
+        The effective group_id to use for the operation, or None if rejected.
+    """
+    allowed = get_allowed_group_ids()
+    
+    if allowed is None:
+        # No allowlist set - use original priority: tool param > default > empty string
+        if tool_group_id is not None:
+            return tool_group_id
+        if default_group_id is not None:
+            return default_group_id
+        return ''
+    
+    # Allowlist is set
+    if len(allowed) == 1:
+        # Single entry in allowlist - use it as fixed group_id, ignore tool parameter
+        return allowed[0]
+    
+    # Multiple entries in allowlist - tool parameter must be validated
+    if tool_group_id is not None:
+        if tool_group_id in allowed:
+            return tool_group_id
+        else:
+            # Tool parameter not in allowlist - rejected
+            return None
+    
+    # No tool parameter provided
+    if default_group_id is not None and default_group_id in allowed:
+        return default_group_id
+    
+    # Fall back to first entry in allowlist
+    return allowed[0]
+
+
+def get_effective_group_ids(
+    tool_group_ids: list[str] | None,
+    default_group_id: str | None = None
+) -> list[str] | None:
+    """Get the effective group_ids to use for search operations, respecting the header allowlist.
+    
+    Behavior:
+    - If X-Group-Id header is set, only group_ids in the allowlist are permitted
+    - If tool provides group_ids, they are filtered to only include allowed ones
+    - If the result would be empty (all tool group_ids rejected), returns None
+    
+    Args:
+        tool_group_ids: List of group_ids passed in the tool call parameters.
+        default_group_id: The default group_id from config (usually from CLI --group-id).
+        
+    Returns:
+        List of effective group_ids to use, or None if all were rejected.
+    """
+    allowed = get_allowed_group_ids()
+    
+    if allowed is None:
+        # No allowlist set - use original behavior
+        if tool_group_ids is not None:
+            return tool_group_ids
+        if default_group_id is not None:
+            return [default_group_id]
+        return []
+    
+    # Allowlist is set
+    if tool_group_ids is not None:
+        # Filter tool_group_ids to only include allowed ones
+        filtered = [gid for gid in tool_group_ids if gid in allowed]
+        if not filtered:
+            # All provided group_ids were rejected
+            return None
+        return filtered
+    
+    # No tool group_ids provided - use the full allowlist
+    return allowed
 
 
 class Requirement(BaseModel):
@@ -378,7 +525,7 @@ class GraphitiConfig(BaseModel):
 class MCPConfig(BaseModel):
     """Configuration for MCP server."""
 
-    transport: str = 'sse'  # Default to SSE transport
+    transport: str = 'streamable-http'  # Default to Streamable HTTP transport (MCP 2025-06-18)
 
     @classmethod
     def from_cli(cls, args: argparse.Namespace) -> 'MCPConfig':
@@ -510,18 +657,47 @@ async def get_authenticated_principal(request: Request) -> dict[str, str]:
 
 
 class AuthenticationMiddleware:
-    """Pure ASGI middleware to enforce nonce token authentication.
+    """Pure ASGI middleware to enforce nonce token authentication and extract group_id header.
 
     This is a pure ASGI middleware (not BaseHTTPMiddleware) to avoid conflicts
-    with SSE streaming responses.
+    with HTTP streaming responses.
 
-    The nonce token must be provided as a query parameter on the FIRST request (/sse).
+    The nonce token must be provided as a query parameter on the FIRST request:
+    - /mcp for Streamable HTTP transport (MCP 2025-06-18 standard)
+    - /sse for legacy SSE transport
+    
     Subsequent requests in the same session (like /messages/ and /register) are part of
     the authenticated session.
+    
+    Additionally, this middleware extracts the X-Group-Id header if present and stores it
+    in a context variable. The header can contain multiple comma-separated group_ids which
+    act as an allowlist - only these group_ids will be permitted for tool calls.
     """
 
     def __init__(self, app: ASGIApp):
         self.app = app
+
+    def _extract_allowed_group_ids(self, scope: Scope) -> list[str] | None:
+        """Extract the X-Group-Id header value(s) from the request scope.
+        
+        The header can contain multiple comma-separated group_ids which act as an allowlist.
+        
+        Args:
+            scope: ASGI connection scope containing headers
+            
+        Returns:
+            List of allowed group_ids from the X-Group-Id header, or None if not present.
+        """
+        headers = scope.get('headers', [])
+        # Headers are stored as list of tuples: [(name_bytes, value_bytes), ...]
+        header_name_lower = GROUP_ID_HEADER_NAME.lower().encode('latin-1')
+        for name, value in headers:
+            if name.lower() == header_name_lower:
+                header_value = value.decode('latin-1')
+                # Parse comma-separated values and strip whitespace
+                group_ids = [gid.strip() for gid in header_value.split(',') if gid.strip()]
+                return group_ids if group_ids else None
+        return None
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         """ASGI middleware entry point.
@@ -543,38 +719,53 @@ class AuthenticationMiddleware:
         # Debug logging
         logger.debug(f'🔍 MIDDLEWARE CALLED: {method} {path}')
 
-        # Internal MCP endpoints that are part of an authenticated session
-        # These endpoints are called AFTER /sse authentication succeeds
-        internal_endpoints = ['/register', '/messages/', '/.well-known/']
+        # Extract and store the X-Group-Id header if present (supports comma-separated values)
+        allowed_group_ids = self._extract_allowed_group_ids(scope)
+        if allowed_group_ids:
+            logger.info(f'🔑 X-Group-Id header found with allowed group_ids: {allowed_group_ids}')
+        
+        # Set the context variable for the current request context
+        token = set_allowed_group_ids(allowed_group_ids)
+        
+        try:
+            # Internal MCP endpoints that are part of an authenticated session
+            # These endpoints are called AFTER initial connection authentication succeeds
+            internal_endpoints = ['/register', '/messages/', '/.well-known/']
 
-        # Check if this is an internal endpoint (part of session, not initial auth)
-        is_internal = any(path.startswith(ep) for ep in internal_endpoints)
+            # Check if this is an internal endpoint (part of session, not initial auth)
+            is_internal = any(path.startswith(ep) for ep in internal_endpoints)
 
-        # Only authenticate the initial SSE connection (/sse)
-        # Internal endpoints are already protected by session management
-        if path == '/sse' or not is_internal:
-            # Build Request object for authentication
-            from starlette.requests import Request
-            request = Request(scope, receive)
+            # Authenticate the initial connection endpoint
+            # - /sse for legacy SSE transport
+            # - /mcp for new Streamable HTTP transport (MCP 2025-06-18)
+            is_initial_connection = path == '/sse' or path == '/mcp'
+            
+            if is_initial_connection or not is_internal:
+                # Build Request object for authentication
+                from starlette.requests import Request
+                request = Request(scope, receive)
 
-            try:
-                # Authenticate the request
-                await get_authenticated_principal(request)
-            except HTTPException as exc:
-                # Return error response for authentication failures
-                logger.warning(f'🔍 MIDDLEWARE BLOCKED: {method} {path} - {exc.detail}')
+                try:
+                    # Authenticate the request
+                    await get_authenticated_principal(request)
+                except HTTPException as exc:
+                    # Return error response for authentication failures
+                    logger.warning(f'🔍 MIDDLEWARE BLOCKED: {method} {path} - {exc.detail}')
 
-                # Send 401 response directly via ASGI interface
-                response = PlainTextResponse(
-                    content=f'Error: {exc.detail}',
-                    status_code=exc.status_code,
-                    headers=exc.headers or {},
-                )
-                await response(scope, receive, send)
-                return
+                    # Send 401 response directly via ASGI interface
+                    response = PlainTextResponse(
+                        content=f'Error: {exc.detail}',
+                        status_code=exc.status_code,
+                        headers=exc.headers or {},
+                    )
+                    await response(scope, receive, send)
+                    return
 
-        # If authentication succeeds (or is internal endpoint), proceed
-        await self.app(scope, receive, send)
+            # If authentication succeeds (or is internal endpoint), proceed
+            await self.app(scope, receive, send)
+        finally:
+            # Reset the context variable after the request is done
+            _allowed_group_ids_var.reset(token)
 
 
 # Create global config instance - will be properly initialized later
@@ -817,12 +1008,22 @@ async def add_memory(
         elif source.lower() == 'json':
             source_type = EpisodeType.json
 
-        # Use the provided group_id or fall back to the default from config
-        effective_group_id = group_id if group_id is not None else config.group_id
-
-        # Cast group_id to str to satisfy type checker
-        # The Graphiti client expects a str for group_id, not Optional[str]
-        group_id_str = str(effective_group_id) if effective_group_id is not None else ''
+        # Use get_effective_group_id to determine the group_id, respecting the header allowlist
+        group_id_str = get_effective_group_id(group_id, config.group_id)
+        
+        # Check if the group_id was rejected (not in allowlist)
+        if group_id_str is None:
+            allowed = get_allowed_group_ids()
+            return ErrorResponse(
+                error=f"group_id '{group_id}' is not permitted. Allowed group_ids: {allowed}"
+            )
+        
+        # Log if header-based allowlist is being used
+        allowed = get_allowed_group_ids()
+        if allowed is not None and group_id is not None and group_id != group_id_str:
+            logger.info(
+                f"Using group_id '{group_id_str}' from allowlist (tool parameter '{group_id}' was overridden)"
+            )
 
         # We've already checked that graphiti_client is not None above
         # This assert statement helps type checkers understand that graphiti_client is defined
@@ -904,10 +1105,24 @@ async def search_memory_nodes(
         return ErrorResponse(error='Graphiti client not initialized')
 
     try:
-        # Use the provided group_ids or fall back to the default from config if none provided
-        effective_group_ids = (
-            group_ids if group_ids is not None else [config.group_id] if config.group_id else []
-        )
+        # Use get_effective_group_ids to determine allowed group_ids, respecting the header allowlist
+        effective_group_ids = get_effective_group_ids(group_ids, config.group_id)
+        
+        # Check if all provided group_ids were rejected (not in allowlist)
+        if effective_group_ids is None:
+            allowed = get_allowed_group_ids()
+            return ErrorResponse(
+                error=f"Provided group_ids {group_ids} are not permitted. Allowed group_ids: {allowed}"
+            )
+        
+        # Log if header-based allowlist is filtering the group_ids
+        allowed = get_allowed_group_ids()
+        if allowed is not None and group_ids is not None:
+            filtered_out = [gid for gid in group_ids if gid not in allowed]
+            if filtered_out:
+                logger.info(
+                    f"Filtered out group_ids not in allowlist: {filtered_out}"
+                )
 
         # Configure the search
         if center_node_uuid is not None:
@@ -984,10 +1199,24 @@ async def search_memory_facts(
         if max_facts <= 0:
             return ErrorResponse(error='max_facts must be a positive integer')
 
-        # Use the provided group_ids or fall back to the default from config if none provided
-        effective_group_ids = (
-            group_ids if group_ids is not None else [config.group_id] if config.group_id else []
-        )
+        # Use get_effective_group_ids to determine allowed group_ids, respecting the header allowlist
+        effective_group_ids = get_effective_group_ids(group_ids, config.group_id)
+        
+        # Check if all provided group_ids were rejected (not in allowlist)
+        if effective_group_ids is None:
+            allowed = get_allowed_group_ids()
+            return ErrorResponse(
+                error=f"Provided group_ids {group_ids} are not permitted. Allowed group_ids: {allowed}"
+            )
+        
+        # Log if header-based allowlist is filtering the group_ids
+        allowed = get_allowed_group_ids()
+        if allowed is not None and group_ids is not None:
+            filtered_out = [gid for gid in group_ids if gid not in allowed]
+            if filtered_out:
+                logger.info(
+                    f"Filtered out group_ids not in allowlist: {filtered_out}"
+                )
 
         # We've already checked that graphiti_client is not None above
         assert graphiti_client is not None
@@ -1163,11 +1392,22 @@ async def get_episodes(
         return ErrorResponse(error='Graphiti client not initialized')
 
     try:
-        # Use the provided group_id or fall back to the default from config
-        effective_group_id = group_id if group_id is not None else config.group_id
-
-        if not isinstance(effective_group_id, str):
-            return ErrorResponse(error='Group ID must be a string')
+        # Use get_effective_group_id to determine the group_id, respecting the header allowlist
+        effective_group_id = get_effective_group_id(group_id, config.group_id)
+        
+        # Check if the group_id was rejected (not in allowlist)
+        if effective_group_id is None:
+            allowed = get_allowed_group_ids()
+            return ErrorResponse(
+                error=f"group_id '{group_id}' is not permitted. Allowed group_ids: {allowed}"
+            )
+        
+        # Log if header-based allowlist is being used
+        allowed = get_allowed_group_ids()
+        if allowed is not None and group_id is not None and group_id != effective_group_id:
+            logger.info(
+                f"Using group_id '{effective_group_id}' from allowlist (tool parameter '{group_id}' was overridden)"
+            )
 
         # We've already checked that graphiti_client is not None above
         assert graphiti_client is not None
@@ -1268,9 +1508,9 @@ async def initialize_server() -> MCPConfig:
     )
     parser.add_argument(
         '--transport',
-        choices=['sse', 'stdio'],
-        default='sse',
-        help='Transport to use for communication with the client. (default: sse)',
+        choices=['streamable-http', 'sse', 'stdio'],
+        default='streamable-http',
+        help='Transport to use for communication with the client. (default: streamable-http, the MCP 2025-06-18 standard)',
     )
     parser.add_argument(
         '--model', help=f'Model name to use with the LLM client. (default: {DEFAULT_LLM_MODEL})'
@@ -1330,12 +1570,42 @@ async def run_mcp_server():
     # Initialize the server
     mcp_config = await initialize_server()
 
-    # Run the server with stdio transport for MCP in the same event loop
+    # Run the server with the configured transport
     logger.info(f'Starting MCP server with transport: {mcp_config.transport}')
     if mcp_config.transport == 'stdio':
         await mcp.run_stdio_async()
+    elif mcp_config.transport == 'streamable-http':
+        # Get the Streamable HTTP app instance (MCP 2025-06-18 standard)
+        http_app = mcp.streamable_http_app()
+        logger.debug(f'🔍 Streamable HTTP app type: {type(http_app)}')
+        logger.debug(f'🔍 Streamable HTTP app id: {id(http_app)}')
+
+        # Wrap with authentication middleware if tokens are configured
+        if ALLOWED_NONCE_TOKENS:
+            logger.info('🔒 Wrapping Streamable HTTP app with authentication middleware')
+            wrapped_app = AuthenticationMiddleware(http_app)
+            logger.info('🔒 Authentication middleware applied')
+        else:
+            logger.warning('⚠️  No authentication middleware - all requests allowed')
+            wrapped_app = http_app
+
+        # Start uvicorn directly with the wrapped app
+        logger.info(
+            f'Running MCP server with Streamable HTTP transport on {mcp.settings.host}:{mcp.settings.port}/mcp'
+        )
+
+        # Create uvicorn config with the wrapped app instance
+        config = uvicorn.Config(
+            wrapped_app,
+            host=mcp.settings.host,
+            port=mcp.settings.port,
+            log_level='debug',
+        )
+        server = uvicorn.Server(config)
+        await server.serve()
     elif mcp_config.transport == 'sse':
-        # Get the SSE app instance ONCE
+        # Legacy SSE transport (deprecated in MCP 2025-06-18)
+        logger.warning('⚠️  SSE transport is deprecated. Consider using streamable-http instead.')
         sse_app = mcp.sse_app()
         logger.debug(f'🔍 SSE app type: {type(sse_app)}')
         logger.debug(f'🔍 SSE app id: {id(sse_app)}')
@@ -1343,7 +1613,6 @@ async def run_mcp_server():
         # Wrap with authentication middleware if tokens are configured
         if ALLOWED_NONCE_TOKENS:
             logger.info('🔒 Wrapping SSE app with authentication middleware')
-            # Wrap the ASGI app with our pure ASGI middleware
             wrapped_app = AuthenticationMiddleware(sse_app)
             logger.info('🔒 Authentication middleware applied')
         else:
@@ -1352,7 +1621,7 @@ async def run_mcp_server():
 
         # Start uvicorn directly with the wrapped app
         logger.info(
-            f'Running MCP server with SSE transport on {mcp.settings.host}:{mcp.settings.port}'
+            f'Running MCP server with SSE transport on {mcp.settings.host}:{mcp.settings.port}/sse'
         )
 
         # Create uvicorn config with the wrapped app instance

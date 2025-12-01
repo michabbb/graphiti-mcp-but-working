@@ -94,10 +94,14 @@ OPENAI_API_KEY=your-openai-api-key
 
 ### Starting the Server
 
-Start the MCP server with SSE transport (required for HTTP authentication):
+Start the MCP server with HTTP-based transport (required for HTTP authentication):
 
 ```bash
 cd mcp_server
+# Using Streamable HTTP transport (MCP 2025-06-18 standard, recommended)
+python3 graphiti_mcp_server.py --transport streamable-http
+
+# Or using legacy SSE transport
 python3 graphiti_mcp_server.py --transport sse
 ```
 
@@ -106,8 +110,8 @@ python3 graphiti_mcp_server.py --transport sse
 ```
 INFO - 🔒 AUTHENTICATION ENABLED: Loaded 3 nonce token(s) for authentication
 INFO - 🔒 Requests must include valid nonce token (?nonce=<token>)
-INFO - 🔒 Adding authentication middleware to SSE endpoints
-INFO - Running MCP server with SSE transport on 0.0.0.0:8000
+INFO - 🔒 Wrapping Streamable HTTP app with authentication middleware
+INFO - Running MCP server with Streamable HTTP transport on 0.0.0.0:8000/mcp
 ```
 
 **Without authentication** (MCP_SERVER_NONCE_TOKENS not set), you'll see:
@@ -115,7 +119,7 @@ INFO - Running MCP server with SSE transport on 0.0.0.0:8000
 ```
 WARNING - ⚠️  AUTHENTICATION DISABLED: MCP_SERVER_NONCE_TOKENS not configured
 WARNING - ⚠️  Server will accept ALL requests without authentication!
-INFO - Running MCP server with SSE transport on 0.0.0.0:8000
+INFO - Running MCP server with Streamable HTTP transport on 0.0.0.0:8000/mcp
 ```
 
 ### Making Authenticated Requests
@@ -123,13 +127,16 @@ INFO - Running MCP server with SSE transport on 0.0.0.0:8000
 Add the `nonce` query parameter to your requests:
 
 ```bash
-# Example: Check server status
+# Using Streamable HTTP transport (MCP 2025-06-18)
+curl "http://localhost:8000/mcp?nonce=your-token-here"
+
+# Using legacy SSE transport
 curl "http://localhost:8000/sse?nonce=your-token-here"
 ```
 
 ```bash
 # Example with a real token
-curl "http://localhost:8000/sse?nonce=ShjDhieHfxxxxxx"
+curl "http://localhost:8000/mcp?nonce=ShjDhieHfxxxxxx"
 ```
 
 ### Authentication Logging
@@ -140,16 +147,16 @@ Each authentication attempt is logged to help you monitor access.
 ```
 INFO - 🔒 AUTHENTICATION ENABLED: Loaded 2 nonce token(s) for authentication
 INFO - 🔒 Requests must include valid nonce token (?nonce=<token>)
-INFO - 🔒 Registering authentication middleware on SSE app
-DEBUG - 🔍 SSE app type: <class 'starlette.applications.Starlette'>
-DEBUG - 🔍 SSE app id: 140234567890123
+INFO - 🔒 Wrapping Streamable HTTP app with authentication middleware
+DEBUG - 🔍 Streamable HTTP app type: <class 'starlette.applications.Starlette'>
+DEBUG - 🔍 Streamable HTTP app id: 140234567890123
 INFO - 🔒 Middleware registered. App has 1 middleware(s)
-INFO - Running MCP server with SSE transport on 0.0.0.0:8000
+INFO - Running MCP server with Streamable HTTP transport on 0.0.0.0:8000/mcp
 ```
 
 **Per-request logging** (when DEBUG level enabled):
 ```
-DEBUG - 🔍 MIDDLEWARE CALLED: GET /sse
+DEBUG - 🔍 MIDDLEWARE CALLED: GET /mcp
 INFO - ✓ Authentication successful with nonce token
 ```
 
@@ -162,14 +169,27 @@ WARNING - 🔍 MIDDLEWARE BLOCKED: POST /messages/ - Invalid nonce token
 
 **Failed authentication (missing token):**
 ```
-DEBUG - 🔍 MIDDLEWARE CALLED: GET /sse
+DEBUG - 🔍 MIDDLEWARE CALLED: GET /mcp
 WARNING - ✗ Authentication failed: No nonce token provided
-WARNING - 🔍 MIDDLEWARE BLOCKED: GET /sse - Not authenticated
+WARNING - 🔍 MIDDLEWARE BLOCKED: GET /mcp - Not authenticated
 ```
 
 ### MCP Client Configuration
 
 Configure your MCP client to include the nonce token in requests. Example for Claude Desktop or similar MCP clients:
+
+```json
+{
+  "mcpServers": {
+    "graphiti": {
+      "url": "http://localhost:8000/mcp?nonce=ShjDhieHfxxxxxx",
+      "transport": "streamable-http"
+    }
+  }
+}
+```
+
+For legacy SSE transport:
 
 ```json
 {
@@ -187,15 +207,66 @@ Configure your MCP client to include the nonce token in requests. Example for Cl
 ### Middleware-Based Authentication
 
 The authentication is implemented as **Starlette middleware** that intercepts HTTP requests before they reach endpoints. This ensures:
-- The initial SSE connection (`/sse`) requires authentication via nonce token
+- The initial connection (`/mcp` for Streamable HTTP or `/sse` for legacy SSE) requires authentication via nonce token
 - Internal MCP endpoints (`/messages/`, `/register`, etc.) are protected by session management
 - Early rejection of unauthorized requests
 
 **How it works:**
-1. Client connects to `/sse?nonce=<token>` - **Authentication required**
+1. Client connects to `/mcp?nonce=<token>` (Streamable HTTP) or `/sse?nonce=<token>` (legacy SSE) - **Authentication required**
 2. If valid, a session is established
 3. Subsequent requests to `/messages/`, `/register` use the authenticated session
 4. No need to include nonce on every request after initial connection
+
+### X-Group-Id Header Support
+
+The middleware also supports extracting `group_id` values from the `X-Group-Id` HTTP header. The header supports comma-separated values which act as an **allowlist** for permitted group_ids.
+
+**Single group_id:**
+- The header value becomes the **fixed group_id** for all tool calls
+- Any `group_id` passed in tool call parameters will be **ignored**
+
+**Multiple group_ids (comma-separated):**
+- Only these group_ids are **permitted** for tool calls
+- Tool parameters that match an allowed group_id are accepted
+- Tool parameters not in the allowlist are **rejected** with an error message showing the allowed group_ids
+- If no tool parameter is provided, the first allowed group_id is used
+
+This enables secure multi-tenant deployments where the allowed group_ids are set by the infrastructure.
+
+**Error messages** include the allowed group_ids when a request is rejected:
+```
+group_id 'wrong-tenant' is not permitted. Allowed group_ids: ['tenant-a', 'tenant-b']
+```
+
+**Example with single group_id:**
+```bash
+# Using Streamable HTTP transport (MCP 2025-06-18)
+curl "http://localhost:8000/mcp?nonce=your-token" \
+  -H "X-Group-Id: tenant-123"
+
+# Using legacy SSE transport
+curl "http://localhost:8000/sse?nonce=your-token" \
+  -H "X-Group-Id: tenant-123"
+```
+
+**Example with multiple allowed group_ids:**
+```bash
+curl "http://localhost:8000/mcp?nonce=your-token" \
+  -H "X-Group-Id: tenant-a, tenant-b, tenant-c"
+```
+
+**Priority order with single group_id:**
+1. Header group_id is always used (tool parameter ignored)
+
+**Priority order with multiple group_ids (allowlist):**
+1. Tool parameter (if in allowlist)
+2. CLI default (if in allowlist)
+3. First entry in allowlist (fallback)
+
+**Priority order without header:**
+1. Tool parameter
+2. CLI default `--group-id`
+3. Empty string (fallback)
 
 ### Constant-Time Comparison
 
