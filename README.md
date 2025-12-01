@@ -119,6 +119,7 @@ The server uses the following environment variables:
 - `MODEL_NAME`: OpenAI model name to use for LLM operations.
 - `SMALL_MODEL_NAME`: OpenAI model name to use for smaller LLM operations.
 - `LLM_TEMPERATURE`: Temperature for LLM responses (0.0-2.0).
+- `CLEAR_GRAPH_PASSWORD`: Password required for the `clear_graph` tool. If not set, the `clear_graph` tool will be disabled and return an error when called.
 - `AZURE_OPENAI_ENDPOINT`: Optional Azure OpenAI LLM endpoint URL
 - `AZURE_OPENAI_DEPLOYMENT_NAME`: Optional Azure OpenAI LLM deployment name
 - `AZURE_OPENAI_API_VERSION`: Optional Azure OpenAI LLM API version
@@ -312,7 +313,7 @@ The Graphiti MCP server exposes the following tools:
 - `delete_episode`: Delete an episode from the knowledge graph
 - `get_entity_edge`: Get an entity edge by its UUID
 - `get_episodes`: Get the most recent episodes for a specific group
-- `clear_graph`: Clear all data from the knowledge graph and rebuild indices
+- `clear_graph`: Clear all data from the knowledge graph and rebuild indices. **Requires password authentication** - the `password` parameter must match the `CLEAR_GRAPH_PASSWORD` environment variable. If `CLEAR_GRAPH_PASSWORD` is not configured on the server, this tool will be disabled and return an error.
 - `get_status`: Get the status of the Graphiti MCP server and Neo4j connection
 
 ## Using the X-Group-Id Header
