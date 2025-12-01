@@ -525,7 +525,7 @@ class GraphitiConfig(BaseModel):
 class MCPConfig(BaseModel):
     """Configuration for MCP server."""
 
-    transport: str = 'sse'  # Default to SSE transport
+    transport: str = 'streamable-http'  # Default to Streamable HTTP transport (MCP 2025-06-18)
 
     @classmethod
     def from_cli(cls, args: argparse.Namespace) -> 'MCPConfig':
@@ -660,9 +660,12 @@ class AuthenticationMiddleware:
     """Pure ASGI middleware to enforce nonce token authentication and extract group_id header.
 
     This is a pure ASGI middleware (not BaseHTTPMiddleware) to avoid conflicts
-    with SSE streaming responses.
+    with HTTP streaming responses.
 
-    The nonce token must be provided as a query parameter on the FIRST request (/sse).
+    The nonce token must be provided as a query parameter on the FIRST request:
+    - /mcp for Streamable HTTP transport (MCP 2025-06-18 standard)
+    - /sse for legacy SSE transport
+    
     Subsequent requests in the same session (like /messages/ and /register) are part of
     the authenticated session.
     
@@ -726,15 +729,18 @@ class AuthenticationMiddleware:
         
         try:
             # Internal MCP endpoints that are part of an authenticated session
-            # These endpoints are called AFTER /sse authentication succeeds
+            # These endpoints are called AFTER initial connection authentication succeeds
             internal_endpoints = ['/register', '/messages/', '/.well-known/']
 
             # Check if this is an internal endpoint (part of session, not initial auth)
             is_internal = any(path.startswith(ep) for ep in internal_endpoints)
 
-            # Only authenticate the initial SSE connection (/sse)
-            # Internal endpoints are already protected by session management
-            if path == '/sse' or not is_internal:
+            # Authenticate the initial connection endpoint
+            # - /sse for legacy SSE transport
+            # - /mcp for new Streamable HTTP transport (MCP 2025-06-18)
+            is_initial_connection = path == '/sse' or path == '/mcp'
+            
+            if is_initial_connection or not is_internal:
                 # Build Request object for authentication
                 from starlette.requests import Request
                 request = Request(scope, receive)
@@ -1502,9 +1508,9 @@ async def initialize_server() -> MCPConfig:
     )
     parser.add_argument(
         '--transport',
-        choices=['sse', 'stdio'],
-        default='sse',
-        help='Transport to use for communication with the client. (default: sse)',
+        choices=['streamable-http', 'sse', 'stdio'],
+        default='streamable-http',
+        help='Transport to use for communication with the client. (default: streamable-http, the MCP 2025-06-18 standard)',
     )
     parser.add_argument(
         '--model', help=f'Model name to use with the LLM client. (default: {DEFAULT_LLM_MODEL})'
@@ -1564,12 +1570,42 @@ async def run_mcp_server():
     # Initialize the server
     mcp_config = await initialize_server()
 
-    # Run the server with stdio transport for MCP in the same event loop
+    # Run the server with the configured transport
     logger.info(f'Starting MCP server with transport: {mcp_config.transport}')
     if mcp_config.transport == 'stdio':
         await mcp.run_stdio_async()
+    elif mcp_config.transport == 'streamable-http':
+        # Get the Streamable HTTP app instance (MCP 2025-06-18 standard)
+        http_app = mcp.streamable_http_app()
+        logger.debug(f'🔍 Streamable HTTP app type: {type(http_app)}')
+        logger.debug(f'🔍 Streamable HTTP app id: {id(http_app)}')
+
+        # Wrap with authentication middleware if tokens are configured
+        if ALLOWED_NONCE_TOKENS:
+            logger.info('🔒 Wrapping Streamable HTTP app with authentication middleware')
+            wrapped_app = AuthenticationMiddleware(http_app)
+            logger.info('🔒 Authentication middleware applied')
+        else:
+            logger.warning('⚠️  No authentication middleware - all requests allowed')
+            wrapped_app = http_app
+
+        # Start uvicorn directly with the wrapped app
+        logger.info(
+            f'Running MCP server with Streamable HTTP transport on {mcp.settings.host}:{mcp.settings.port}/mcp'
+        )
+
+        # Create uvicorn config with the wrapped app instance
+        config = uvicorn.Config(
+            wrapped_app,
+            host=mcp.settings.host,
+            port=mcp.settings.port,
+            log_level='debug',
+        )
+        server = uvicorn.Server(config)
+        await server.serve()
     elif mcp_config.transport == 'sse':
-        # Get the SSE app instance ONCE
+        # Legacy SSE transport (deprecated in MCP 2025-06-18)
+        logger.warning('⚠️  SSE transport is deprecated. Consider using streamable-http instead.')
         sse_app = mcp.sse_app()
         logger.debug(f'🔍 SSE app type: {type(sse_app)}')
         logger.debug(f'🔍 SSE app id: {id(sse_app)}')
@@ -1577,7 +1613,6 @@ async def run_mcp_server():
         # Wrap with authentication middleware if tokens are configured
         if ALLOWED_NONCE_TOKENS:
             logger.info('🔒 Wrapping SSE app with authentication middleware')
-            # Wrap the ASGI app with our pure ASGI middleware
             wrapped_app = AuthenticationMiddleware(sse_app)
             logger.info('🔒 Authentication middleware applied')
         else:
@@ -1586,7 +1621,7 @@ async def run_mcp_server():
 
         # Start uvicorn directly with the wrapped app
         logger.info(
-            f'Running MCP server with SSE transport on {mcp.settings.host}:{mcp.settings.port}'
+            f'Running MCP server with SSE transport on {mcp.settings.host}:{mcp.settings.port}/sse'
         )
 
         # Create uvicorn config with the wrapped app instance
