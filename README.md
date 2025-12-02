@@ -120,14 +120,6 @@ The server uses the following environment variables:
 - `SMALL_MODEL_NAME`: OpenAI model name to use for smaller LLM operations.
 - `LLM_TEMPERATURE`: Temperature for LLM responses (0.0-2.0).
 - `CLEAR_GRAPH_PASSWORD`: Password required for the `clear_graph` tool. If not set, the `clear_graph` tool will be disabled and return an error when called.
-- `AZURE_OPENAI_ENDPOINT`: Optional Azure OpenAI LLM endpoint URL
-- `AZURE_OPENAI_DEPLOYMENT_NAME`: Optional Azure OpenAI LLM deployment name
-- `AZURE_OPENAI_API_VERSION`: Optional Azure OpenAI LLM API version
-- `AZURE_OPENAI_EMBEDDING_API_KEY`: Optional Azure OpenAI Embedding deployment key (if other than `OPENAI_API_KEY`)
-- `AZURE_OPENAI_EMBEDDING_ENDPOINT`: Optional Azure OpenAI Embedding endpoint URL
-- `AZURE_OPENAI_EMBEDDING_DEPLOYMENT_NAME`: Optional Azure OpenAI embedding deployment name
-- `AZURE_OPENAI_EMBEDDING_API_VERSION`: Optional Azure OpenAI API version
-- `AZURE_OPENAI_USE_MANAGED_IDENTITY`: Optional use Azure Managed Identities for authentication
 - `SEMAPHORE_LIMIT`: Episode processing concurrency. See [Concurrency and LLM Provider 429 Rate Limit Errors](#concurrency-and-llm-provider-429-rate-limit-errors)
 
 You can set these variables in a `.env` file in the project directory.
