@@ -1440,9 +1440,29 @@ async def get_episodes(
 
 
 @mcp.tool()
-async def clear_graph() -> SuccessResponse | ErrorResponse:
-    """Clear all data from the graph memory and rebuild indices."""
+async def clear_graph(password: str) -> SuccessResponse | ErrorResponse:
+    """Clear all data from the graph memory and rebuild indices.
+
+    This is a destructive operation that requires password authentication.
+    The password must match the CLEAR_GRAPH_PASSWORD environment variable.
+
+    Args:
+        password: The password required to authorize clearing the graph.
+                  Must match the CLEAR_GRAPH_PASSWORD environment variable.
+    """
     global graphiti_client
+
+    # Check if CLEAR_GRAPH_PASSWORD is configured
+    expected_password = os.environ.get('CLEAR_GRAPH_PASSWORD')
+    if not expected_password:
+        return ErrorResponse(
+            error='The clear_graph tool is not available because CLEAR_GRAPH_PASSWORD is not set on the MCP server'
+        )
+
+    # Validate the password using constant-time comparison to prevent timing attacks
+    if not secrets.compare_digest(password, expected_password):
+        logger.warning('clear_graph called with invalid password')
+        return ErrorResponse(error='Invalid password provided for clear_graph')
 
     if graphiti_client is None:
         return ErrorResponse(error='Graphiti client not initialized')
@@ -1457,6 +1477,7 @@ async def clear_graph() -> SuccessResponse | ErrorResponse:
         # clear_data is already imported at the top
         await clear_data(client.driver)
         await client.build_indices_and_constraints()
+        logger.info('Graph cleared successfully by authenticated user')
         return SuccessResponse(message='Graph cleared successfully and indices rebuilt')
     except Exception as e:
         error_msg = str(e)
