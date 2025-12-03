@@ -1780,7 +1780,7 @@ async def delete_everything_by_group_id(group_id: str) -> DeleteGroupResponse | 
 
         count_records, _, _ = await client.driver.execute_query(
             count_query,
-            parameters_={'group_id': effective_group_id}
+            params={'group_id': effective_group_id}
         )
 
         episode_count = 0
@@ -1800,7 +1800,7 @@ async def delete_everything_by_group_id(group_id: str) -> DeleteGroupResponse | 
         """
         await client.driver.execute_query(
             delete_edges_query,
-            parameters_={'group_id': effective_group_id}
+            params={'group_id': effective_group_id}
         )
 
         # Delete all nodes (including episodes) with this group_id
@@ -1811,7 +1811,7 @@ async def delete_everything_by_group_id(group_id: str) -> DeleteGroupResponse | 
         """
         await client.driver.execute_query(
             delete_nodes_query,
-            parameters_={'group_id': effective_group_id}
+            params={'group_id': effective_group_id}
         )
 
         total_deleted = episode_count + node_count + edge_count
