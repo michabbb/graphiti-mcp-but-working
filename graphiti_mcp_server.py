@@ -6,14 +6,19 @@ Graphiti MCP Server - Exposes Graphiti functionality through the Model Context P
 import argparse
 import asyncio
 import contextvars
+import json
 import logging
 import os
 import secrets
+import signal
 import sys
+import uuid as uuid_module
 from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any, cast
 from typing_extensions import TypedDict
+
+import redis.asyncio as aioredis
 
 from dotenv import load_dotenv
 
@@ -479,6 +484,53 @@ class Neo4jConfig(BaseModel):
         )
 
 
+class RedisConfig(BaseModel):
+    """Configuration for Redis connection."""
+
+    host: str = 'localhost'
+    port: int = 6379
+    db: int = 0
+    password: str | None = None
+    queue_prefix: str = 'graphiti:episodes:'
+    processing_prefix: str = 'graphiti:processing:'
+
+    @classmethod
+    def from_env(cls) -> 'RedisConfig':
+        """Create Redis configuration from environment variables."""
+        return cls(
+            host=os.environ.get('REDIS_HOST', 'localhost'),
+            port=int(os.environ.get('REDIS_PORT', '6379')),
+            db=int(os.environ.get('REDIS_DB', '0')),
+            password=os.environ.get('REDIS_PASSWORD'),
+            queue_prefix=os.environ.get('REDIS_QUEUE_PREFIX', 'graphiti:episodes:'),
+            processing_prefix=os.environ.get('REDIS_PROCESSING_PREFIX', 'graphiti:processing:'),
+        )
+
+
+class QueuedEpisode(BaseModel):
+    """Serializable episode data for Redis queue."""
+
+    job_id: str = Field(default_factory=lambda: str(uuid_module.uuid4()))
+    name: str
+    episode_body: str
+    source: str  # 'text', 'json', 'message'
+    source_description: str
+    group_id: str
+    uuid: str | None = None
+    reference_time: str  # ISO format datetime
+    use_custom_entities: bool = False
+    queued_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+    def to_json(self) -> str:
+        """Serialize to JSON string for Redis storage."""
+        return self.model_dump_json()
+
+    @classmethod
+    def from_json(cls, data: str) -> 'QueuedEpisode':
+        """Deserialize from JSON string."""
+        return cls.model_validate_json(data)
+
+
 class GraphitiConfig(BaseModel):
     """Configuration for Graphiti client.
 
@@ -488,6 +540,7 @@ class GraphitiConfig(BaseModel):
     llm: GraphitiLLMConfig = Field(default_factory=GraphitiLLMConfig)
     embedder: GraphitiEmbedderConfig = Field(default_factory=GraphitiEmbedderConfig)
     neo4j: Neo4jConfig = Field(default_factory=Neo4jConfig)
+    redis: RedisConfig = Field(default_factory=RedisConfig)
     group_id: str | None = None
     use_custom_entities: bool = False
     destroy_graph: bool = False
@@ -499,6 +552,7 @@ class GraphitiConfig(BaseModel):
             llm=GraphitiLLMConfig.from_env(),
             embedder=GraphitiEmbedderConfig.from_env(),
             neo4j=Neo4jConfig.from_env(),
+            redis=RedisConfig.from_env(),
         )
 
     @classmethod
@@ -814,6 +868,259 @@ _sse_app_instance = None
 # Initialize Graphiti client
 graphiti_client: Graphiti | None = None
 
+# Redis client and queue manager (initialized later)
+redis_client: aioredis.Redis | None = None
+
+# Shutdown event for graceful shutdown
+shutdown_event: asyncio.Event = asyncio.Event()
+
+# Track active worker tasks for cleanup
+worker_tasks: dict[str, asyncio.Task] = {}
+
+
+class RedisQueueManager:
+    """Manages episode queues using Redis for persistence.
+
+    Uses Redis Lists with BRPOPLPUSH pattern for reliable queue processing:
+    - Episodes are added to a queue list (LPUSH)
+    - Workers pop from queue and push to processing list (BRPOPLPUSH)
+    - On success, item is removed from processing list
+    - On startup, any items in processing list are moved back to queue (recovery)
+    """
+
+    def __init__(self, redis: aioredis.Redis, config: RedisConfig):
+        self.redis = redis
+        self.config = config
+        self._logger = logging.getLogger(__name__)
+
+    def _queue_key(self, group_id: str) -> str:
+        """Get the Redis key for a group's episode queue."""
+        return f"{self.config.queue_prefix}{group_id}"
+
+    def _processing_key(self, group_id: str) -> str:
+        """Get the Redis key for a group's processing list."""
+        return f"{self.config.processing_prefix}{group_id}"
+
+    async def enqueue(self, episode: QueuedEpisode) -> int:
+        """Add an episode to the queue for its group_id.
+
+        Returns:
+            The new queue length after adding the episode.
+        """
+        queue_key = self._queue_key(episode.group_id)
+        # LPUSH adds to the left (head), workers will BRPOP from right (tail) = FIFO
+        length = await self.redis.lpush(queue_key, episode.to_json())
+        self._logger.info(
+            f"Enqueued episode '{episode.name}' for group_id '{episode.group_id}' "
+            f"(job_id: {episode.job_id}, queue length: {length})"
+        )
+        return length
+
+    async def dequeue(self, group_id: str, timeout: float = 1.0) -> QueuedEpisode | None:
+        """Pop an episode from the queue and move it to processing list.
+
+        Uses BRPOPLPUSH for atomic move from queue to processing list.
+        This ensures that if the worker crashes, the item can be recovered.
+
+        Args:
+            group_id: The group_id to dequeue from
+            timeout: How long to wait for an item (seconds)
+
+        Returns:
+            The dequeued episode, or None if timeout
+        """
+        queue_key = self._queue_key(group_id)
+        processing_key = self._processing_key(group_id)
+
+        # BRPOPLPUSH: Pop from queue tail, push to processing list head
+        # This is atomic and ensures no data loss
+        result = await self.redis.brpoplpush(queue_key, processing_key, timeout=int(timeout))
+
+        if result is None:
+            return None
+
+        try:
+            # Result is bytes, decode and parse
+            if isinstance(result, bytes):
+                result = result.decode('utf-8')
+            return QueuedEpisode.from_json(result)
+        except Exception as e:
+            self._logger.error(f"Failed to parse episode from queue: {e}")
+            # Remove invalid item from processing list
+            await self.redis.lrem(processing_key, 1, result)
+            return None
+
+    async def complete(self, group_id: str, episode: QueuedEpisode) -> None:
+        """Mark an episode as completed by removing it from the processing list."""
+        processing_key = self._processing_key(group_id)
+        # Remove the item from the processing list
+        await self.redis.lrem(processing_key, 1, episode.to_json())
+        self._logger.debug(f"Completed episode '{episode.name}' (job_id: {episode.job_id})")
+
+    async def fail(self, group_id: str, episode: QueuedEpisode, requeue: bool = True) -> None:
+        """Handle a failed episode.
+
+        Args:
+            group_id: The group_id
+            episode: The failed episode
+            requeue: If True, move back to queue for retry. If False, just remove from processing.
+        """
+        processing_key = self._processing_key(group_id)
+
+        # Remove from processing list
+        await self.redis.lrem(processing_key, 1, episode.to_json())
+
+        if requeue:
+            # Re-add to queue (at the end, so it's processed last)
+            queue_key = self._queue_key(group_id)
+            await self.redis.rpush(queue_key, episode.to_json())
+            self._logger.warning(
+                f"Re-queued failed episode '{episode.name}' (job_id: {episode.job_id})"
+            )
+        else:
+            self._logger.error(
+                f"Dropped failed episode '{episode.name}' (job_id: {episode.job_id})"
+            )
+
+    async def recover_processing(self, group_id: str) -> int:
+        """Recover any items left in the processing list (from a crash).
+
+        Moves all items from processing list back to the queue.
+
+        Returns:
+            Number of items recovered.
+        """
+        processing_key = self._processing_key(group_id)
+        queue_key = self._queue_key(group_id)
+
+        recovered = 0
+        while True:
+            # Pop from processing, push to queue (at the front for priority)
+            item = await self.redis.rpoplpush(processing_key, queue_key)
+            if item is None:
+                break
+            recovered += 1
+
+        if recovered > 0:
+            self._logger.info(
+                f"Recovered {recovered} episode(s) from processing list for group_id '{group_id}'"
+            )
+        return recovered
+
+    async def get_queue_length(self, group_id: str) -> int:
+        """Get the current queue length for a group_id."""
+        queue_key = self._queue_key(group_id)
+        return await self.redis.llen(queue_key)
+
+    async def get_all_group_ids(self) -> list[str]:
+        """Get all group_ids that have queues (either pending or processing)."""
+        # Scan for all queue keys
+        group_ids = set()
+
+        # Check queue keys
+        async for key in self.redis.scan_iter(match=f"{self.config.queue_prefix}*"):
+            if isinstance(key, bytes):
+                key = key.decode('utf-8')
+            group_id = key.replace(self.config.queue_prefix, '')
+            group_ids.add(group_id)
+
+        # Check processing keys
+        async for key in self.redis.scan_iter(match=f"{self.config.processing_prefix}*"):
+            if isinstance(key, bytes):
+                key = key.decode('utf-8')
+            group_id = key.replace(self.config.processing_prefix, '')
+            group_ids.add(group_id)
+
+        return list(group_ids)
+
+    async def recover_all(self) -> int:
+        """Recover all processing items across all group_ids.
+
+        Called on startup to handle any items that were being processed
+        when the server crashed.
+
+        Returns:
+            Total number of items recovered.
+        """
+        total_recovered = 0
+        group_ids = await self.get_all_group_ids()
+
+        for group_id in group_ids:
+            recovered = await self.recover_processing(group_id)
+            total_recovered += recovered
+
+        if total_recovered > 0:
+            self._logger.info(f"Total recovered episodes from crash: {total_recovered}")
+
+        return total_recovered
+
+
+# Global queue manager instance
+queue_manager: RedisQueueManager | None = None
+
+# Dictionary to track if a worker is running for each group_id
+queue_workers: dict[str, bool] = {}
+
+
+async def initialize_redis() -> None:
+    """Initialize Redis connection and queue manager."""
+    global redis_client, queue_manager, config
+
+    try:
+        # Create Redis connection
+        redis_client = aioredis.Redis(
+            host=config.redis.host,
+            port=config.redis.port,
+            db=config.redis.db,
+            password=config.redis.password,
+            decode_responses=False,  # We handle decoding ourselves
+        )
+
+        # Test connection
+        await redis_client.ping()
+        logger.info(f"Connected to Redis at {config.redis.host}:{config.redis.port}")
+
+        # Create queue manager
+        queue_manager = RedisQueueManager(redis_client, config.redis)
+
+        # Recover any items that were being processed when we crashed
+        recovered = await queue_manager.recover_all()
+        if recovered > 0:
+            logger.info(f"Recovered {recovered} episode(s) from previous crash")
+
+        # Start workers for any existing queues
+        await start_workers_for_existing_queues()
+
+    except Exception as e:
+        logger.error(f"Failed to initialize Redis: {str(e)}")
+        raise
+
+
+async def start_workers_for_existing_queues() -> None:
+    """Start workers for any queues that have pending items."""
+    global queue_manager, queue_workers
+
+    if queue_manager is None:
+        return
+
+    group_ids = await queue_manager.get_all_group_ids()
+
+    for group_id in group_ids:
+        queue_length = await queue_manager.get_queue_length(group_id)
+        if queue_length > 0 and not queue_workers.get(group_id, False):
+            logger.info(f"Starting worker for existing queue '{group_id}' with {queue_length} items")
+            task = asyncio.create_task(process_episode_queue(group_id))
+            worker_tasks[group_id] = task
+
+
+async def shutdown_redis() -> None:
+    """Gracefully shutdown Redis connection."""
+    global redis_client
+
+    if redis_client is not None:
+        await redis_client.close()
+        logger.info("Redis connection closed")
+
 
 async def initialize_graphiti():
     """Initialize the Graphiti client with the configured settings."""
@@ -890,44 +1197,102 @@ def format_fact_result(edge: EntityEdge) -> dict[str, Any]:
     return result
 
 
-# Dictionary to store queues for each group_id
-# Each queue is a list of tasks to be processed sequentially
-episode_queues: dict[str, asyncio.Queue] = {}
-# Dictionary to track if a worker is running for each group_id
-queue_workers: dict[str, bool] = {}
-
-
 async def process_episode_queue(group_id: str):
-    """Process episodes for a specific group_id sequentially.
+    """Process episodes for a specific group_id sequentially using Redis queue.
 
     This function runs as a long-lived task that processes episodes
-    from the queue one at a time.
+    from the Redis queue one at a time. It supports graceful shutdown
+    and crash recovery.
     """
-    global queue_workers
+    global queue_workers, queue_manager, graphiti_client, shutdown_event
 
     logger.info(f'Starting episode queue worker for group_id: {group_id}')
     queue_workers[group_id] = True
 
     try:
-        while True:
-            # Get the next episode processing function from the queue
-            # This will wait if the queue is empty
-            process_func = await episode_queues[group_id].get()
+        while not shutdown_event.is_set():
+            if queue_manager is None:
+                logger.error(f'Queue manager not initialized for group_id {group_id}')
+                await asyncio.sleep(1)
+                continue
 
+            # Try to get an episode from the queue
+            # Short timeout allows us to check shutdown_event regularly
+            episode = await queue_manager.dequeue(group_id, timeout=1.0)
+
+            if episode is None:
+                # No items in queue, check if we should continue
+                queue_length = await queue_manager.get_queue_length(group_id)
+                if queue_length == 0 and not shutdown_event.is_set():
+                    # Queue is empty and no shutdown - wait a bit and check again
+                    # After 30 seconds of no activity, stop the worker
+                    # It will be restarted when new items are added
+                    await asyncio.sleep(1)
+                    queue_length = await queue_manager.get_queue_length(group_id)
+                    if queue_length == 0:
+                        logger.info(f'Queue for group_id {group_id} is empty, stopping worker')
+                        break
+                continue
+
+            # Process the episode
             try:
-                # Process the episode
-                await process_func()
+                logger.info(f"Processing episode '{episode.name}' for group_id: {group_id} (job_id: {episode.job_id})")
+
+                if graphiti_client is None:
+                    raise RuntimeError('Graphiti client not initialized')
+
+                # Use cast to help the type checker
+                client = cast(Graphiti, graphiti_client)
+
+                # Map source string to EpisodeType enum
+                source_type = EpisodeType.text
+                if episode.source.lower() == 'message':
+                    source_type = EpisodeType.message
+                elif episode.source.lower() == 'json':
+                    source_type = EpisodeType.json
+
+                # Use custom entity types if enabled
+                entity_types = ENTITY_TYPES if episode.use_custom_entities else {}
+
+                # Parse reference time
+                reference_time = datetime.fromisoformat(episode.reference_time)
+
+                await client.add_episode(
+                    name=episode.name,
+                    episode_body=episode.episode_body,
+                    source=source_type,
+                    source_description=episode.source_description,
+                    group_id=episode.group_id,
+                    uuid=episode.uuid,
+                    reference_time=reference_time,
+                    entity_types=entity_types,
+                )
+
+                logger.info(f"Episode '{episode.name}' processed successfully (job_id: {episode.job_id})")
+
+                # Mark as completed (remove from processing list)
+                await queue_manager.complete(group_id, episode)
+
             except Exception as e:
-                logger.error(f'Error processing queued episode for group_id {group_id}: {str(e)}')
-            finally:
-                # Mark the task as done regardless of success/failure
-                episode_queues[group_id].task_done()
+                error_msg = str(e)
+                logger.error(
+                    f"Error processing episode '{episode.name}' for group_id {group_id}: {error_msg}"
+                )
+                # Don't requeue on error - the item stays in processing list
+                # and will be recovered on next startup
+                # This prevents infinite retry loops for bad data
+                if queue_manager is not None:
+                    await queue_manager.fail(group_id, episode, requeue=False)
+
     except asyncio.CancelledError:
         logger.info(f'Episode queue worker for group_id {group_id} was cancelled')
+        # Don't re-raise - we want to complete the finally block
     except Exception as e:
         logger.error(f'Unexpected error in queue worker for group_id {group_id}: {str(e)}')
     finally:
         queue_workers[group_id] = False
+        if group_id in worker_tasks:
+            del worker_tasks[group_id]
         logger.info(f'Stopped episode queue worker for group_id: {group_id}')
 
 
@@ -995,29 +1360,25 @@ async def add_memory(
         - Entities will be created from appropriate JSON properties
         - Relationships between entities will be established based on the JSON structure
     """
-    global graphiti_client, episode_queues, queue_workers
+    global graphiti_client, queue_manager, queue_workers, worker_tasks
 
     if graphiti_client is None:
         return ErrorResponse(error='Graphiti client not initialized')
 
-    try:
-        # Map string source to EpisodeType enum
-        source_type = EpisodeType.text
-        if source.lower() == 'message':
-            source_type = EpisodeType.message
-        elif source.lower() == 'json':
-            source_type = EpisodeType.json
+    if queue_manager is None:
+        return ErrorResponse(error='Redis queue manager not initialized')
 
+    try:
         # Use get_effective_group_id to determine the group_id, respecting the header allowlist
         group_id_str = get_effective_group_id(group_id, config.group_id)
-        
+
         # Check if the group_id was rejected (not in allowlist)
         if group_id_str is None:
             allowed = get_allowed_group_ids()
             return ErrorResponse(
                 error=f"group_id '{group_id}' is not permitted. Allowed group_ids: {allowed}"
             )
-        
+
         # Log if header-based allowlist is being used
         allowed = get_allowed_group_ids()
         if allowed is not None and group_id is not None and group_id != group_id_str:
@@ -1025,53 +1386,29 @@ async def add_memory(
                 f"Using group_id '{group_id_str}' from allowlist (tool parameter '{group_id}' was overridden)"
             )
 
-        # We've already checked that graphiti_client is not None above
-        # This assert statement helps type checkers understand that graphiti_client is defined
-        assert graphiti_client is not None, 'graphiti_client should not be None here'
+        # Create a serializable episode object for Redis queue
+        queued_episode = QueuedEpisode(
+            name=name,
+            episode_body=episode_body,
+            source=source.lower(),
+            source_description=source_description,
+            group_id=group_id_str,
+            uuid=uuid,
+            reference_time=datetime.now(timezone.utc).isoformat(),
+            use_custom_entities=config.use_custom_entities,
+        )
 
-        # Use cast to help the type checker understand that graphiti_client is not None
-        client = cast(Graphiti, graphiti_client)
-
-        # Define the episode processing function
-        async def process_episode():
-            try:
-                logger.info(f"Processing queued episode '{name}' for group_id: {group_id_str}")
-                # Use all entity types if use_custom_entities is enabled, otherwise use empty dict
-                entity_types = ENTITY_TYPES if config.use_custom_entities else {}
-
-                await client.add_episode(
-                    name=name,
-                    episode_body=episode_body,
-                    source=source_type,
-                    source_description=source_description,
-                    group_id=group_id_str,  # Using the string version of group_id
-                    uuid=uuid,
-                    reference_time=datetime.now(timezone.utc),
-                    entity_types=entity_types,
-                )
-                logger.info(f"Episode '{name}' added successfully")
-
-                logger.info(f"Episode '{name}' processed successfully")
-            except Exception as e:
-                error_msg = str(e)
-                logger.error(
-                    f"Error processing episode '{name}' for group_id {group_id_str}: {error_msg}"
-                )
-
-        # Initialize queue for this group_id if it doesn't exist
-        if group_id_str not in episode_queues:
-            episode_queues[group_id_str] = asyncio.Queue()
-
-        # Add the episode processing function to the queue
-        await episode_queues[group_id_str].put(process_episode)
+        # Add to Redis queue
+        queue_length = await queue_manager.enqueue(queued_episode)
 
         # Start a worker for this queue if one isn't already running
         if not queue_workers.get(group_id_str, False):
-            asyncio.create_task(process_episode_queue(group_id_str))
+            task = asyncio.create_task(process_episode_queue(group_id_str))
+            worker_tasks[group_id_str] = task
 
         # Return immediately with a success message
         return SuccessResponse(
-            message=f"Episode '{name}' queued for processing (position: {episode_queues[group_id_str].qsize()})"
+            message=f"Episode '{name}' queued for processing (position: {queue_length}, job_id: {queued_episode.job_id})"
         )
     except Exception as e:
         error_msg = str(e)
@@ -1577,6 +1914,9 @@ async def initialize_server() -> MCPConfig:
     # Initialize Graphiti
     await initialize_graphiti()
 
+    # Initialize Redis queue manager
+    await initialize_redis()
+
     if args.host:
         logger.info(f'Setting MCP server host to: {args.host}')
         # Set MCP server host from CLI or env
@@ -1586,8 +1926,92 @@ async def initialize_server() -> MCPConfig:
     return MCPConfig.from_cli(args)
 
 
+async def graceful_shutdown(sig: signal.Signals | None = None) -> None:
+    """Perform graceful shutdown of all services.
+
+    This function:
+    1. Sets the shutdown event to signal workers to stop
+    2. Waits for active workers to complete their current task
+    3. Closes Redis connection
+    4. Closes Graphiti client connection
+    """
+    global shutdown_event, worker_tasks, graphiti_client
+
+    if sig:
+        logger.info(f'Received signal {sig.name}, initiating graceful shutdown...')
+    else:
+        logger.info('Initiating graceful shutdown...')
+
+    # Signal all workers to stop
+    shutdown_event.set()
+
+    # Wait for active workers to complete (with timeout)
+    if worker_tasks:
+        logger.info(f'Waiting for {len(worker_tasks)} worker(s) to complete current task...')
+
+        # Give workers time to finish their current task
+        # Workers check shutdown_event every 1 second, so this should be enough
+        try:
+            # Wait up to 30 seconds for workers to finish
+            done, pending = await asyncio.wait(
+                list(worker_tasks.values()),
+                timeout=30.0,
+                return_when=asyncio.ALL_COMPLETED
+            )
+
+            if pending:
+                logger.warning(f'{len(pending)} worker(s) did not finish in time, cancelling...')
+                for task in pending:
+                    task.cancel()
+                # Wait for cancelled tasks to clean up
+                await asyncio.gather(*pending, return_exceptions=True)
+
+            logger.info('All workers stopped')
+        except Exception as e:
+            logger.error(f'Error waiting for workers: {e}')
+
+    # Close Redis connection
+    await shutdown_redis()
+
+    # Close Graphiti client connection
+    if graphiti_client is not None:
+        try:
+            await graphiti_client.close()
+            logger.info('Graphiti client connection closed')
+        except Exception as e:
+            logger.error(f'Error closing Graphiti client: {e}')
+
+    logger.info('Graceful shutdown complete')
+
+
+def setup_signal_handlers(loop: asyncio.AbstractEventLoop) -> None:
+    """Set up signal handlers for graceful shutdown."""
+
+    def signal_handler(sig: signal.Signals) -> None:
+        """Handle shutdown signals."""
+        logger.info(f'Received signal {sig.name}')
+        # Schedule the shutdown coroutine
+        asyncio.create_task(graceful_shutdown(sig))
+
+    # Register signal handlers
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(
+                sig,
+                lambda s=sig: signal_handler(s)
+            )
+            logger.debug(f'Registered signal handler for {sig.name}')
+        except NotImplementedError:
+            # Windows doesn't support add_signal_handler
+            logger.warning(f'Signal handler for {sig.name} not supported on this platform')
+
+
 async def run_mcp_server():
     """Run the MCP server in the current event loop."""
+    # Set up signal handlers for graceful shutdown
+    loop = asyncio.get_running_loop()
+    setup_signal_handlers(loop)
+
     # Initialize the server
     mcp_config = await initialize_server()
 
@@ -1661,9 +2085,13 @@ def main():
     try:
         # Run everything in a single event loop
         asyncio.run(run_mcp_server())
+    except KeyboardInterrupt:
+        logger.info('Server stopped by user (KeyboardInterrupt)')
     except Exception as e:
         logger.error(f'Error initializing Graphiti MCP server: {str(e)}')
         raise
+    finally:
+        logger.info('Graphiti MCP server shut down')
 
 
 if __name__ == '__main__':
