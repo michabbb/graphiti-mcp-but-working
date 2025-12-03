@@ -19,10 +19,11 @@ This enhanced version includes several important improvements over the original 
 2. **🤖 GPT-5, O1, O3 Model Support** - Proper handling of OpenAI's reasoning models with automatic parameter adjustment (disables temperature, reasoning, and verbosity parameters)
 3. **🔒 Token-Based Authentication** - Production-ready nonce token authentication system enabling secure public deployment
 4. **📊 New `list_group_ids` Tool** - Discover and manage all group IDs across nodes and relationships in your knowledge graph
-5. **🛡️ Enhanced Security** - Pure ASGI middleware-based authentication with constant-time token comparison to prevent timing attacks
-6. **🔇 Telemetry Control** - Automatic disabling of telemetry for privacy-focused deployments (set before graphiti_core imports)
-7. **⚡ Simplified Dependencies** - Removed Azure OpenAI dependencies for easier setup and deployment
-8. **🌐 MCP 2025-06-18 Support** - Uses the new Streamable HTTP transport standard (with SSE fallback for legacy clients)
+5. **🗑️ Atomic Group Deletion** - New `delete_everything_by_group_id` tool for complete group removal in a single call (episodes, nodes, and edges)
+6. **🛡️ Enhanced Security** - Pure ASGI middleware-based authentication with constant-time token comparison to prevent timing attacks
+7. **🔇 Telemetry Control** - Automatic disabling of telemetry for privacy-focused deployments (set before graphiti_core imports)
+8. **⚡ Simplified Dependencies** - Removed Azure OpenAI dependencies for easier setup and deployment
+9. **🌐 MCP 2025-06-18 Support** - Uses the new Streamable HTTP transport standard (with SSE fallback for legacy clients)
 
 ### About Azure Support
 
@@ -304,6 +305,7 @@ The Graphiti MCP server exposes the following tools:
 - `search_facts`: Search the knowledge graph for relevant facts (edges between entities)
 - `delete_entity_edge`: Delete an entity edge from the knowledge graph
 - `delete_episode`: Delete an episode from the knowledge graph
+- `delete_everything_by_group_id`: Delete all data (episodes, nodes, and entity edges) associated with a group_id. This is an atomic operation that completely removes a group from the system in a single call. Returns counts of deleted entities.
 - `get_entity_edge`: Get an entity edge by its UUID
 - `get_episodes`: Get the most recent episodes for a specific group
 - `get_queue_status`: Get the current status of all episode processing queues. Shows total pending tasks, active workers, and per-group_id queue details. Use this to monitor background processing after adding memories.
