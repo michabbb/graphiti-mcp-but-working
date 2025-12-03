@@ -62,18 +62,21 @@ class GraphitiLLMConfig(BaseModel):
         config = cls.from_env()
 
         # CLI arguments override environment variables when provided
-        if hasattr(args, 'model') and args.model:
-            # Only use CLI model if it's not empty
+        # Use "is not None" to detect if argument was passed (even if empty string)
+        if hasattr(args, 'model') and args.model is not None:
             if args.model.strip():
                 config.model = args.model
             else:
-                # Log that empty model was provided and default is used
+                # Empty string explicitly provided - reset to default
+                config.model = DEFAULT_LLM_MODEL
                 logger.warning(f'Empty model name provided, using default: {DEFAULT_LLM_MODEL}')
 
-        if hasattr(args, 'small_model') and args.small_model:
+        if hasattr(args, 'small_model') and args.small_model is not None:
             if args.small_model.strip():
                 config.small_model = args.small_model
             else:
+                # Empty string explicitly provided - reset to default
+                config.small_model = SMALL_LLM_MODEL
                 logger.warning(f'Empty small_model name provided, using default: {SMALL_LLM_MODEL}')
 
         if hasattr(args, 'temperature') and args.temperature is not None:
