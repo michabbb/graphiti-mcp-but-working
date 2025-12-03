@@ -33,6 +33,7 @@ os.environ['GRAPHITI_TELEMETRY_ENABLED'] = 'false'
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security.utils import get_authorization_scheme_param
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import BaseModel, Field
 from starlette.responses import PlainTextResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
@@ -327,6 +328,18 @@ class EpisodeSearchResponse(TypedDict):
 class StatusResponse(TypedDict):
     status: str
     message: str
+
+
+class QueueInfo(TypedDict):
+    group_id: str
+    pending_tasks: int
+    worker_active: bool
+
+
+class QueueStatusResponse(TypedDict):
+    total_pending: int
+    active_workers: int
+    queues: list[QueueInfo]
 
 
 class GroupIdResult(TypedDict):
@@ -1822,6 +1835,57 @@ async def clear_graph(password: str) -> SuccessResponse | ErrorResponse:
         return ErrorResponse(error=f'Error clearing graph: {error_msg}')
 
 
+@mcp.tool()
+async def get_queue_status() -> QueueStatusResponse:
+    """Get the current status of all episode processing queues.
+
+    This tool provides visibility into the background processing queues that handle
+    episodes after they are submitted via add_memory. It shows:
+    - Total number of pending tasks across all queues
+    - Number of active worker processes
+    - Per-group_id queue details including pending tasks and worker status
+
+    Use this tool to monitor the processing status after adding memories, especially
+    when adding multiple episodes in succession.
+    """
+    global episode_queues, queue_workers
+
+    queues_info: list[QueueInfo] = []
+    total_pending = 0
+    active_workers = 0
+
+    # Get all known group_ids from both queues and workers
+    all_group_ids = set(episode_queues.keys()) | set(queue_workers.keys())
+
+    for group_id in sorted(all_group_ids):
+        # Get queue size (0 if queue doesn't exist)
+        pending = episode_queues[group_id].qsize() if group_id in episode_queues else 0
+        # Check if worker is active
+        worker_active = queue_workers.get(group_id, False)
+
+        total_pending += pending
+        if worker_active:
+            active_workers += 1
+
+        queues_info.append(
+            QueueInfo(
+                group_id=group_id,
+                pending_tasks=pending,
+                worker_active=worker_active,
+            )
+        )
+
+    logger.info(
+        f'Queue status: {total_pending} pending tasks, {active_workers} active workers'
+    )
+
+    return QueueStatusResponse(
+        total_pending=total_pending,
+        active_workers=active_workers,
+        queues=queues_info,
+    )
+
+
 @mcp.resource('http://graphiti/status')
 async def get_status() -> StatusResponse:
     """Get the status of the Graphiti MCP server and Neo4j connection."""
@@ -1921,6 +1985,34 @@ async def initialize_server() -> MCPConfig:
         logger.info(f'Setting MCP server host to: {args.host}')
         # Set MCP server host from CLI or env
         mcp.settings.host = args.host
+
+    # Configure transport security based on host binding
+    # When binding to 0.0.0.0 (all interfaces), we need to configure allowed hosts
+    # to prevent DNS rebinding protection from blocking legitimate requests
+    allowed_hosts_env = os.environ.get('ALLOWED_HOSTS', '')
+    if mcp.settings.host == '0.0.0.0':
+        if allowed_hosts_env:
+            # Parse comma-separated allowed hosts
+            allowed_hosts = [h.strip() for h in allowed_hosts_env.split(',') if h.strip()]
+            # Add wildcard port patterns for each host
+            allowed_hosts_with_ports = [f'{h}:*' for h in allowed_hosts]
+            allowed_origins = [f'http://{h}:*' for h in allowed_hosts] + [
+                f'https://{h}:*' for h in allowed_hosts
+            ]
+            logger.info(f'Configuring transport security with allowed hosts: {allowed_hosts}')
+            mcp.settings.transport_security = TransportSecuritySettings(
+                enable_dns_rebinding_protection=True,
+                allowed_hosts=allowed_hosts_with_ports,
+                allowed_origins=allowed_origins,
+            )
+        else:
+            # No ALLOWED_HOSTS configured - disable DNS rebinding protection
+            logger.warning(
+                '⚠️  Host is 0.0.0.0 but ALLOWED_HOSTS not set - disabling DNS rebinding protection'
+            )
+            mcp.settings.transport_security = TransportSecuritySettings(
+                enable_dns_rebinding_protection=False,
+            )
 
     # Return MCP configuration
     return MCPConfig.from_cli(args)
