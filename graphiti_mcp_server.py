@@ -330,14 +330,24 @@ class StatusResponse(TypedDict):
     message: str
 
 
+class ProcessingJobInfo(TypedDict):
+    job_id: str
+    name: str
+    group_id: str
+    queued_at: str
+
+
 class QueueInfo(TypedDict):
     group_id: str
     pending_tasks: int
+    processing_tasks: int
+    processing_jobs: list[ProcessingJobInfo]
     worker_active: bool
 
 
 class QueueStatusResponse(TypedDict):
     total_pending: int
+    total_processing: int
     active_workers: int
     queues: list[QueueInfo]
 
@@ -1024,6 +1034,26 @@ class RedisQueueManager:
         """Get the current queue length for a group_id."""
         queue_key = self._queue_key(group_id)
         return await self.redis.llen(queue_key)
+
+    async def get_processing_items(self, group_id: str) -> list[QueuedEpisode]:
+        """Get all items currently being processed for a group_id."""
+        processing_key = self._processing_key(group_id)
+        items = await self.redis.lrange(processing_key, 0, -1)
+
+        result = []
+        for item in items:
+            try:
+                if isinstance(item, bytes):
+                    item = item.decode('utf-8')
+                result.append(QueuedEpisode.from_json(item))
+            except Exception as e:
+                self._logger.error(f"Failed to parse processing item: {e}")
+        return result
+
+    async def get_processing_count(self, group_id: str) -> int:
+        """Get the count of items currently being processed for a group_id."""
+        processing_key = self._processing_key(group_id)
+        return await self.redis.llen(processing_key)
 
     async def get_all_group_ids(self) -> list[str]:
         """Get all group_ids that have queues (either pending or processing)."""
@@ -1841,9 +1871,15 @@ async def get_queue_status() -> QueueStatusResponse | ErrorResponse:
 
     This tool provides visibility into the background processing queues that handle
     episodes after they are submitted via add_memory. It shows:
-    - Total number of pending tasks across all queues
+    - Total number of pending tasks across all queues (waiting to be processed)
+    - Total number of processing tasks (currently being processed by workers)
     - Number of active worker processes
-    - Per-group_id queue details including pending tasks and worker status
+    - Per-group_id queue details including pending tasks, processing tasks, and worker status
+
+    Jobs go through these states:
+    1. pending: Waiting in queue to be picked up by a worker
+    2. processing: Currently being processed (extracting entities, creating facts, etc.)
+    3. completed: Finished and removed from queue (not shown in status)
 
     Use this tool to monitor the processing status after adding memories, especially
     when adding multiple episodes in succession.
@@ -1856,6 +1892,7 @@ async def get_queue_status() -> QueueStatusResponse | ErrorResponse:
     try:
         queues_info: list[QueueInfo] = []
         total_pending = 0
+        total_processing = 0
         active_workers = 0
 
         # Get all known group_ids from Redis queues and active workers
@@ -1863,29 +1900,47 @@ async def get_queue_status() -> QueueStatusResponse | ErrorResponse:
         all_group_ids = set(redis_group_ids) | set(queue_workers.keys())
 
         for group_id in sorted(all_group_ids):
-            # Get queue size from Redis
+            # Get queue size from Redis (pending items)
             pending = await queue_manager.get_queue_length(group_id)
+            # Get processing items from Redis
+            processing_items = await queue_manager.get_processing_items(group_id)
+            processing_count = len(processing_items)
             # Check if worker is active
             worker_active = queue_workers.get(group_id, False)
 
             total_pending += pending
+            total_processing += processing_count
             if worker_active:
                 active_workers += 1
+
+            # Convert processing items to ProcessingJobInfo
+            processing_jobs: list[ProcessingJobInfo] = [
+                ProcessingJobInfo(
+                    job_id=item.job_id,
+                    name=item.name,
+                    group_id=item.group_id,
+                    queued_at=item.queued_at,
+                )
+                for item in processing_items
+            ]
 
             queues_info.append(
                 QueueInfo(
                     group_id=group_id,
                     pending_tasks=pending,
+                    processing_tasks=processing_count,
+                    processing_jobs=processing_jobs,
                     worker_active=worker_active,
                 )
             )
 
         logger.info(
-            f'Queue status: {total_pending} pending tasks, {active_workers} active workers'
+            f'Queue status: {total_pending} pending, {total_processing} processing, {active_workers} active workers'
         )
 
         return QueueStatusResponse(
             total_pending=total_pending,
+            total_processing=total_processing,
             active_workers=active_workers,
             queues=queues_info,
         )
