@@ -305,6 +305,7 @@ The Graphiti MCP server exposes the following tools:
 - `delete_episode`: Delete an episode from the knowledge graph
 - `get_entity_edge`: Get an entity edge by its UUID
 - `get_episodes`: Get the most recent episodes for a specific group
+- `get_queue_status`: Get the current status of all episode processing queues. Shows total pending tasks, active workers, and per-group_id queue details. Use this to monitor background processing after adding memories.
 - `clear_graph`: Clear all data from the knowledge graph and rebuild indices. **Requires password authentication** - the `password` parameter must match the `CLEAR_GRAPH_PASSWORD` environment variable. If `CLEAR_GRAPH_PASSWORD` is not configured on the server, this tool will be disabled and return an error.
 - `get_status`: Get the status of the Graphiti MCP server and Neo4j connection
 
