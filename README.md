@@ -121,6 +121,7 @@ The server uses the following environment variables:
 - `LLM_TEMPERATURE`: Temperature for LLM responses (0.0-2.0).
 - `CLEAR_GRAPH_PASSWORD`: Password required for the `clear_graph` tool. If not set, the `clear_graph` tool will be disabled and return an error when called.
 - `SEMAPHORE_LIMIT`: Episode processing concurrency. See [Concurrency and LLM Provider 429 Rate Limit Errors](#concurrency-and-llm-provider-429-rate-limit-errors)
+- `ALLOWED_HOSTS`: Comma-separated list of allowed hostnames for DNS rebinding protection (e.g., `graphiti.example.com,api.example.com`). Required when running on `0.0.0.0` with external access. If not set when binding to `0.0.0.0`, DNS rebinding protection will be disabled with a warning.
 
 You can set these variables in a `.env` file in the project directory.
 
@@ -305,6 +306,7 @@ The Graphiti MCP server exposes the following tools:
 - `delete_episode`: Delete an episode from the knowledge graph
 - `get_entity_edge`: Get an entity edge by its UUID
 - `get_episodes`: Get the most recent episodes for a specific group
+- `get_queue_status`: Get the current status of all episode processing queues. Shows total pending tasks, active workers, and per-group_id queue details. Use this to monitor background processing after adding memories.
 - `clear_graph`: Clear all data from the knowledge graph and rebuild indices. **Requires password authentication** - the `password` parameter must match the `CLEAR_GRAPH_PASSWORD` environment variable. If `CLEAR_GRAPH_PASSWORD` is not configured on the server, this tool will be disabled and return an error.
 - `get_status`: Get the status of the Graphiti MCP server and Neo4j connection
 
@@ -522,6 +524,30 @@ GRAPHITI_TELEMETRY_ENABLED=false
 ```
 
 For complete details about what's collected and why, see the [Telemetry section in the main Graphiti README](https://github.com/getzep/graphiti#telemetry).
+
+## Development
+
+### Updating Dependencies
+
+This project uses `uv` for dependency management. The `uv.lock` file is committed to ensure reproducible builds across all environments.
+
+To update dependencies (without requiring a local Python installation):
+
+```bash
+docker run --rm -v "$(pwd):/app" -w /app ghcr.io/astral-sh/uv:latest uv lock --upgrade
+```
+
+This command:
+1. Runs a temporary container with `uv` installed
+2. Mounts your project directory
+3. Updates the `uv.lock` file with the latest compatible versions
+
+After updating, commit the changes:
+
+```bash
+git add uv.lock
+git commit -m "Update dependencies"
+```
 
 ## License
 
