@@ -28,6 +28,7 @@ os.environ['GRAPHITI_TELEMETRY_ENABLED'] = 'false'
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security.utils import get_authorization_scheme_param
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import BaseModel, Field
 from starlette.responses import PlainTextResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
@@ -1644,6 +1645,34 @@ async def initialize_server() -> MCPConfig:
         logger.info(f'Setting MCP server host to: {args.host}')
         # Set MCP server host from CLI or env
         mcp.settings.host = args.host
+
+    # Configure transport security based on host binding
+    # When binding to 0.0.0.0 (all interfaces), we need to configure allowed hosts
+    # to prevent DNS rebinding protection from blocking legitimate requests
+    allowed_hosts_env = os.environ.get('ALLOWED_HOSTS', '')
+    if mcp.settings.host == '0.0.0.0':
+        if allowed_hosts_env:
+            # Parse comma-separated allowed hosts
+            allowed_hosts = [h.strip() for h in allowed_hosts_env.split(',') if h.strip()]
+            # Add wildcard port patterns for each host
+            allowed_hosts_with_ports = [f'{h}:*' for h in allowed_hosts]
+            allowed_origins = [f'http://{h}:*' for h in allowed_hosts] + [
+                f'https://{h}:*' for h in allowed_hosts
+            ]
+            logger.info(f'Configuring transport security with allowed hosts: {allowed_hosts}')
+            mcp.settings.transport_security = TransportSecuritySettings(
+                enable_dns_rebinding_protection=True,
+                allowed_hosts=allowed_hosts_with_ports,
+                allowed_origins=allowed_origins,
+            )
+        else:
+            # No ALLOWED_HOSTS configured - disable DNS rebinding protection
+            logger.warning(
+                '⚠️  Host is 0.0.0.0 but ALLOWED_HOSTS not set - disabling DNS rebinding protection'
+            )
+            mcp.settings.transport_security = TransportSecuritySettings(
+                enable_dns_rebinding_protection=False,
+            )
 
     # Return MCP configuration
     return MCPConfig.from_cli(args)
