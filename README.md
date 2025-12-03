@@ -18,12 +18,17 @@ This enhanced version includes several important improvements over the original 
 1. **🚀 Latest Graphiti Core Compatibility** - Uses the current version of graphiti-core with all latest features and improvements
 2. **🤖 GPT-5, O1, O3 Model Support** - Proper handling of OpenAI's reasoning models with automatic parameter adjustment (disables temperature, reasoning, and verbosity parameters)
 3. **🔒 Token-Based Authentication** - Production-ready nonce token authentication system enabling secure public deployment
-4. **📊 New `list_group_ids` Tool** - Discover and manage all group IDs across nodes and relationships in your knowledge graph
-5. **🗑️ Atomic Group Deletion** - New `delete_everything_by_group_id` tool for complete group removal in a single call (episodes, nodes, and edges)
+4. **📊 Queue Monitoring Tool** - New `get_queue_status` tool to monitor episode processing queues, showing pending tasks, active workers, and jobs currently being processed
+5. **💾 Redis-Based Persistent Queues** - Worker queues backed by Redis with BRPOPLPUSH pattern for crash recovery and graceful shutdown support (SIGTERM/SIGINT handlers)
 6. **🛡️ Enhanced Security** - Pure ASGI middleware-based authentication with constant-time token comparison to prevent timing attacks
-7. **🔇 Telemetry Control** - Automatic disabling of telemetry for privacy-focused deployments (set before graphiti_core imports)
-8. **⚡ Simplified Dependencies** - Removed Azure OpenAI dependencies for easier setup and deployment
-9. **🌐 MCP 2025-06-18 Support** - Uses the new Streamable HTTP transport standard (with SSE fallback for legacy clients)
+7. **🔐 Password-Protected Graph Clearing** - `clear_graph` tool now requires password authentication via CLEAR_GRAPH_PASSWORD environment variable
+8. **🌐 DNS Rebinding Protection** - ALLOWED_HOSTS configuration for secure external access when binding to 0.0.0.0
+9. **📋 New `list_group_ids` Tool** - Discover and manage all group IDs across nodes and relationships in your knowledge graph
+10. **🗑️ Atomic Group Deletion** - New `delete_everything_by_group_id` tool for complete group removal in a single call (episodes, nodes, and edges)
+11. **🔇 Telemetry Control** - Automatic disabling of telemetry for privacy-focused deployments (set before graphiti_core imports)
+12. **⚡ Simplified Dependencies** - Removed Azure OpenAI dependencies for easier setup and deployment
+13. **🌐 MCP 2025-06-18 Support** - Uses the new Streamable HTTP transport standard (with SSE fallback for legacy clients)
+14. **📦 Reproducible Builds** - Tracked uv.lock file ensures consistent dependency versions across all deployments
 
 ### About Azure Support
 
