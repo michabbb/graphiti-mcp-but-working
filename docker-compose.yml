@@ -111,7 +111,7 @@ services:
       - MCP_SERVER_NONCE_TOKENS=${MCP_SERVER_NONCE_TOKENS:-}
       # Example with tokens (DO NOT use these in production!):
       # - MCP_SERVER_NONCE_TOKENS=your-secret-token-here,another-token-here
-    command: ["uv", "run", "graphiti_mcp_server.py", "--transport", "sse"]
+    command: ["uv", "run", "python", "-m", "graphiti_mcp_server", "--transport", "sse"]
     # Graceful shutdown: Wait up to 60 seconds for workers to complete
     stop_grace_period: 60s
 

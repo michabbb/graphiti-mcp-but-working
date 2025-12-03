@@ -11,14 +11,16 @@ The Graphiti MCP Server exposes Graphiti (a knowledge graph memory service for A
 There are two ways to run the server:
 
 ```bash
-# Legacy wrapper (for backward compatibility)
-python graphiti_mcp_server.py [options]
-
-# As a Python package
+# As a Python package (recommended)
 python -m graphiti_mcp_server [options]
+
+# Legacy wrapper script
+python run_server.py [options]
 ```
 
 Both entry points call `graphiti_mcp_server.main:main()`.
+
+**Important**: The wrapper script is named `run_server.py` (not `graphiti_mcp_server.py`) to avoid name conflicts with the package directory.
 
 ## Package Structure
 

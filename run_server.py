@@ -6,9 +6,9 @@ This file is a compatibility wrapper. The actual implementation has been refacto
 into the graphiti_mcp_server package for better maintainability.
 
 Usage:
-    python graphiti_mcp_server.py [options]
+    python run_server.py [options]
 
-Or use the package directly:
+Or use the package directly (recommended):
     python -m graphiti_mcp_server [options]
 """
 

@@ -35,7 +35,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --no-dev
 
 # Copy application code
-COPY graphiti_mcp_server.py ./ 
+COPY graphiti_mcp_server/ ./graphiti_mcp_server/
 
 # Change ownership to app user
 RUN chown -Rv app:app /app
@@ -47,4 +47,4 @@ USER app
 EXPOSE 8000
 
 # Command to run the application
-CMD ["uv", "run", "/app/graphiti_mcp_server.py"]
+CMD ["uv", "run", "python", "-m", "graphiti_mcp_server"]
