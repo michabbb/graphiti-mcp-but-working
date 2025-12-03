@@ -29,6 +29,7 @@ This enhanced version includes several important improvements over the original 
 12. **⚡ Simplified Dependencies** - Removed Azure OpenAI dependencies for easier setup and deployment
 13. **🌐 MCP 2025-06-18 Support** - Uses the new Streamable HTTP transport standard (with SSE fallback for legacy clients)
 14. **📦 Reproducible Builds** - Tracked uv.lock file ensures consistent dependency versions across all deployments
+15. **🏗️ Modular Package Structure** - Refactored into a well-organized Python package with 38 focused modules for better maintainability (see [AGENTS.md](AGENTS.md) for details)
 
 ### About Azure Support
 
@@ -136,17 +137,17 @@ You can set these variables in a `.env` file in the project directory.
 To run the Graphiti MCP server directly using `uv`:
 
 ```bash
-uv run graphiti_mcp_server.py
+uv run python -m graphiti_mcp_server
 ```
 
 With options:
 
 ```bash
 # Using the new Streamable HTTP transport (default, MCP 2025-06-18 standard)
-uv run graphiti_mcp_server.py --model gpt-4.1-mini --transport streamable-http
+uv run python -m graphiti_mcp_server --model gpt-4.1-mini --transport streamable-http
 
 # Using legacy SSE transport (for older clients)
-uv run graphiti_mcp_server.py --model gpt-4.1-mini --transport sse
+uv run python -m graphiti_mcp_server --model gpt-4.1-mini --transport sse
 ```
 
 Available arguments:
@@ -256,10 +257,12 @@ To use the Graphiti MCP server with an MCP-compatible client, configure it to co
         "run",
         "--isolated",
         "--directory",
-        "/Users/<user>>/dev/zep/graphiti/mcp_server",
+        "/Users/<user>/dev/graphiti-mcp-but-working",
         "--project",
         ".",
-        "graphiti_mcp_server.py",
+        "python",
+        "-m",
+        "graphiti_mcp_server",
         "--transport",
         "stdio"
       ],
@@ -425,10 +428,10 @@ To integrate the Graphiti MCP Server with the Cursor IDE, follow these steps:
 
 ```bash
 # Using Streamable HTTP transport (MCP 2025-06-18 standard, recommended)
-python graphiti_mcp_server.py --transport streamable-http --use-custom-entities --group-id <your_group_id>
+python -m graphiti_mcp_server --transport streamable-http --use-custom-entities --group-id <your_group_id>
 
 # Or using legacy SSE transport
-python graphiti_mcp_server.py --transport sse --use-custom-entities --group-id <your_group_id>
+python -m graphiti_mcp_server --transport sse --use-custom-entities --group-id <your_group_id>
 ```
 
 Hint: specify a `group_id` to namespace graph data. If you do not specify a `group_id`, the server will use "default" as the group_id.
