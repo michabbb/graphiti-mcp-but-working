@@ -55,7 +55,7 @@ services:
     # Use custom config for persistence (AOF + RDB)
     command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
     healthcheck:
-      test: ["CMD-SHELL", "redis-cli ping | grep PONG"]
+      test: ["CMD", "redis-cli", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5
