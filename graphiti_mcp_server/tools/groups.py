@@ -20,7 +20,12 @@ logger = logging.getLogger(__name__)
 
 
 async def list_group_ids(limit: int = 500) -> GroupIdListResponse | ErrorResponse:
-    """Return distinct group IDs present on nodes and relationships in the graph."""
+    """Return distinct group IDs present on nodes and relationships in the graph.
+
+    When the X-Group-Id header is set, only group_ids that exist in both the database
+    AND the header allowlist are returned. This ensures tenants can only see their own
+    group_ids.
+    """
     graphiti_client = get_graphiti_client()
 
     if graphiti_client is None:
@@ -49,11 +54,23 @@ async def list_group_ids(limit: int = 500) -> GroupIdListResponse | ErrorRespons
         logger.error(f'Error listing group IDs: {error_msg}')
         return ErrorResponse(error=f'Error listing group IDs: {error_msg}')
 
-    group_ids: list[GroupIdResult] = [
-        {'entity': record['entity'], 'group_id': record['group_id']}
-        for record in records
-        if record['group_id'] is not None
-    ]
+    # Get the allowlist from X-Group-Id header (if set)
+    allowed = get_allowed_group_ids()
+
+    # Build the list of group_ids, filtering by allowlist if set
+    group_ids: list[GroupIdResult] = []
+    for record in records:
+        group_id = record['group_id']
+        if group_id is None:
+            continue
+        # If allowlist is set, only include group_ids that are in the allowlist
+        if allowed is not None and group_id not in allowed:
+            continue
+        group_ids.append({'entity': record['entity'], 'group_id': group_id})
+
+    # Log if filtering was applied
+    if allowed is not None:
+        logger.info(f'list_group_ids: filtered results by allowlist {allowed}')
 
     if not group_ids:
         return GroupIdListResponse(message='No group IDs found', group_ids=[])
