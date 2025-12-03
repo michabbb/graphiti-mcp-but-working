@@ -54,7 +54,6 @@ htmlcov/
 
 # UV
 .uv/
-uv.lock
 
 # Neo4j data (if running locally)
 neo4j_data/

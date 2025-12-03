@@ -525,6 +525,30 @@ GRAPHITI_TELEMETRY_ENABLED=false
 
 For complete details about what's collected and why, see the [Telemetry section in the main Graphiti README](https://github.com/getzep/graphiti#telemetry).
 
+## Development
+
+### Updating Dependencies
+
+This project uses `uv` for dependency management. The `uv.lock` file is committed to ensure reproducible builds across all environments.
+
+To update dependencies (without requiring a local Python installation):
+
+```bash
+docker run --rm -v "$(pwd):/app" -w /app ghcr.io/astral-sh/uv:latest uv lock --upgrade
+```
+
+This command:
+1. Runs a temporary container with `uv` installed
+2. Mounts your project directory
+3. Updates the `uv.lock` file with the latest compatible versions
+
+After updating, commit the changes:
+
+```bash
+git add uv.lock
+git commit -m "Update dependencies"
+```
+
 ## License
 
 This project is licensed under the same license as the parent Graphiti project.
