@@ -1836,7 +1836,7 @@ async def clear_graph(password: str) -> SuccessResponse | ErrorResponse:
 
 
 @mcp.tool()
-async def get_queue_status() -> QueueStatusResponse:
+async def get_queue_status() -> QueueStatusResponse | ErrorResponse:
     """Get the current status of all episode processing queues.
 
     This tool provides visibility into the background processing queues that handle
@@ -1848,42 +1848,51 @@ async def get_queue_status() -> QueueStatusResponse:
     Use this tool to monitor the processing status after adding memories, especially
     when adding multiple episodes in succession.
     """
-    global episode_queues, queue_workers
+    global queue_manager, queue_workers
 
-    queues_info: list[QueueInfo] = []
-    total_pending = 0
-    active_workers = 0
+    if queue_manager is None:
+        return ErrorResponse(error='Redis queue manager not initialized')
 
-    # Get all known group_ids from both queues and workers
-    all_group_ids = set(episode_queues.keys()) | set(queue_workers.keys())
+    try:
+        queues_info: list[QueueInfo] = []
+        total_pending = 0
+        active_workers = 0
 
-    for group_id in sorted(all_group_ids):
-        # Get queue size (0 if queue doesn't exist)
-        pending = episode_queues[group_id].qsize() if group_id in episode_queues else 0
-        # Check if worker is active
-        worker_active = queue_workers.get(group_id, False)
+        # Get all known group_ids from Redis queues and active workers
+        redis_group_ids = await queue_manager.get_all_group_ids()
+        all_group_ids = set(redis_group_ids) | set(queue_workers.keys())
 
-        total_pending += pending
-        if worker_active:
-            active_workers += 1
+        for group_id in sorted(all_group_ids):
+            # Get queue size from Redis
+            pending = await queue_manager.get_queue_length(group_id)
+            # Check if worker is active
+            worker_active = queue_workers.get(group_id, False)
 
-        queues_info.append(
-            QueueInfo(
-                group_id=group_id,
-                pending_tasks=pending,
-                worker_active=worker_active,
+            total_pending += pending
+            if worker_active:
+                active_workers += 1
+
+            queues_info.append(
+                QueueInfo(
+                    group_id=group_id,
+                    pending_tasks=pending,
+                    worker_active=worker_active,
+                )
             )
+
+        logger.info(
+            f'Queue status: {total_pending} pending tasks, {active_workers} active workers'
         )
 
-    logger.info(
-        f'Queue status: {total_pending} pending tasks, {active_workers} active workers'
-    )
-
-    return QueueStatusResponse(
-        total_pending=total_pending,
-        active_workers=active_workers,
-        queues=queues_info,
-    )
+        return QueueStatusResponse(
+            total_pending=total_pending,
+            active_workers=active_workers,
+            queues=queues_info,
+        )
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f'Error getting queue status: {error_msg}')
+        return ErrorResponse(error=f'Error getting queue status: {error_msg}')
 
 
 @mcp.resource('http://graphiti/status')
