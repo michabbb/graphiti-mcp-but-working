@@ -41,6 +41,10 @@ async def process_episode_queue(group_id: str) -> None:
     logger.info(f'Starting episode queue worker for group_id: {group_id}')
     queue_workers[group_id] = True
 
+    # Track idle time for 30-second inactivity timeout
+    idle_seconds = 0
+    idle_timeout = 30
+
     try:
         while not shutdown_event.is_set():
             if queue_manager is None:
@@ -53,18 +57,24 @@ async def process_episode_queue(group_id: str) -> None:
             episode = await queue_manager.dequeue(group_id, timeout=1.0)
 
             if episode is None:
-                # No items in queue, check if we should continue
-                queue_length = await queue_manager.get_queue_length(group_id)
-                if queue_length == 0 and not shutdown_event.is_set():
-                    # Queue is empty and no shutdown - wait a bit and check again
-                    # After 30 seconds of no activity, stop the worker
-                    # It will be restarted when new items are added
-                    await asyncio.sleep(1)
+                # No items in queue, increment idle counter
+                idle_seconds += 1
+
+                # Check if we've reached the inactivity timeout
+                if idle_seconds >= idle_timeout and not shutdown_event.is_set():
                     queue_length = await queue_manager.get_queue_length(group_id)
                     if queue_length == 0:
-                        logger.info(f'Queue for group_id {group_id} is empty, stopping worker')
+                        logger.info(
+                            f'Queue for group_id {group_id} is empty after {idle_timeout}s '
+                            f'of inactivity, stopping worker'
+                        )
                         break
+                    # Queue has items now, reset idle counter
+                    idle_seconds = 0
                 continue
+
+            # Work found - reset idle counter
+            idle_seconds = 0
 
             # Process the episode
             try:

@@ -81,14 +81,16 @@ class GraphitiLLMConfig(BaseModel):
 
         return config
 
-    def create_client(self) -> LLMClient:
+    def create_client(self) -> LLMClient | None:
         """Create an LLM client based on this configuration.
 
         Returns:
-            LLMClient instance
+            LLMClient instance, or None if api_key is not set.
+            Callers should handle the None case appropriately.
         """
         if not self.api_key:
-            raise ValueError('OPENAI_API_KEY must be set when using OpenAI API')
+            logger.warning('OPENAI_API_KEY not set, LLM client will not be available')
+            return None
 
         llm_client_config = LLMConfig(
             api_key=self.api_key, model=self.model, small_model=self.small_model

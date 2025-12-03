@@ -2,6 +2,7 @@
 Principal authentication for Graphiti MCP Server.
 """
 
+import hashlib
 import logging
 
 from fastapi import HTTPException, Request, status
@@ -10,6 +11,18 @@ from fastapi.security.utils import get_authorization_scheme_param
 from graphiti_mcp_server.auth.nonce import ALLOWED_NONCE_TOKENS, is_nonce_valid
 
 logger = logging.getLogger(__name__)
+
+
+def _hash_nonce(nonce: str) -> str:
+    """Create a truncated SHA-256 hash of a nonce for safe logging/identification.
+
+    Args:
+        nonce: The raw nonce token
+
+    Returns:
+        A truncated hex digest (first 12 characters) of the SHA-256 hash
+    """
+    return hashlib.sha256(nonce.encode()).hexdigest()[:12]
 
 
 def extract_bearer_token(request: Request) -> str | None:
@@ -70,9 +83,11 @@ async def get_authenticated_principal(request: Request) -> dict[str, str]:
     nonce = request.query_params.get('nonce')
     if nonce is not None:
         if is_nonce_valid(nonce):
-            logger.info('Authentication successful with nonce token')
+            # Use hashed nonce in client_id to avoid exposing raw secret in logs/identifiers
+            nonce_hash = _hash_nonce(nonce)
+            logger.info(f'Authentication successful (client: nonce:{nonce_hash})')
             return {
-                'client_id': f'nonce:{nonce}',
+                'client_id': f'nonce:{nonce_hash}',
                 'auth_method': 'query_token',
                 'scope': '',
             }

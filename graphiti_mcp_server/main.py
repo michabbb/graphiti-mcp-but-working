@@ -58,6 +58,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Track shutdown tasks to prevent garbage collection
+_shutdown_tasks: list[asyncio.Task] = []
+
 # MCP server instructions
 GRAPHITI_MCP_INSTRUCTIONS = """
 Graphiti is a memory service for AI agents built on a knowledge graph. Graphiti performs well
@@ -285,8 +288,11 @@ def setup_signal_handlers(loop: asyncio.AbstractEventLoop) -> None:
     def signal_handler(sig: signal.Signals) -> None:
         """Handle shutdown signals."""
         logger.info(f'Received signal {sig.name}')
-        # Schedule the shutdown coroutine
-        asyncio.create_task(graceful_shutdown(sig))
+        # Schedule the shutdown coroutine and track the task
+        task = asyncio.create_task(graceful_shutdown(sig))
+        _shutdown_tasks.append(task)
+        # Remove from list when done to allow cleanup
+        task.add_done_callback(lambda t: _shutdown_tasks.remove(t) if t in _shutdown_tasks else None)
 
     # Register signal handlers
     for sig in (signal.SIGTERM, signal.SIGINT):

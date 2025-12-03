@@ -19,8 +19,8 @@ _redis_client: aioredis.Redis | None = None
 # Global queue manager instance
 _queue_manager: 'RedisQueueManager | None' = None
 
-# Shutdown event for graceful shutdown
-_shutdown_event: asyncio.Event = asyncio.Event()
+# Shutdown event for graceful shutdown (lazily initialized to avoid binding to wrong event loop)
+_shutdown_event: asyncio.Event | None = None
 
 # Track active worker tasks for cleanup
 _worker_tasks: dict[str, asyncio.Task] = {}
@@ -52,7 +52,14 @@ def set_queue_manager(manager: 'RedisQueueManager | None') -> None:
 
 
 def get_shutdown_event() -> asyncio.Event:
-    """Get the shutdown event."""
+    """Get the shutdown event, lazily creating it on first access.
+
+    This ensures the event is created under the active event loop,
+    avoiding issues when the module is imported before the loop is running.
+    """
+    global _shutdown_event
+    if _shutdown_event is None:
+        _shutdown_event = asyncio.Event()
     return _shutdown_event
 
 

@@ -15,6 +15,21 @@ from graphiti_mcp_server.utils import format_fact_result
 logger = logging.getLogger(__name__)
 
 
+def _is_not_found_error(error: Exception) -> bool:
+    """Check if an exception indicates a 'not found' condition.
+
+    Args:
+        error: The exception to check
+
+    Returns:
+        True if the error indicates the entity was not found
+    """
+    error_msg = str(error).lower()
+    # Common patterns for "not found" errors in Neo4j/graphiti
+    not_found_patterns = ['not found', 'does not exist', 'no such', 'cannot find']
+    return any(pattern in error_msg for pattern in not_found_patterns)
+
+
 async def get_entity_edge(uuid: str) -> dict[str, Any] | ErrorResponse:
     """Get an entity edge from the graph memory by its UUID.
 
@@ -41,6 +56,9 @@ async def get_entity_edge(uuid: str) -> dict[str, Any] | ErrorResponse:
         return format_fact_result(entity_edge)
     except Exception as e:
         error_msg = str(e)
+        if _is_not_found_error(e):
+            logger.warning(f'Entity edge not found: {uuid}')
+            return ErrorResponse(error=f'Entity edge with UUID {uuid} not found')
         logger.error(f'Error getting entity edge: {error_msg}')
         return ErrorResponse(error=f'Error getting entity edge: {error_msg}')
 
@@ -70,5 +88,8 @@ async def delete_entity_edge(uuid: str) -> SuccessResponse | ErrorResponse:
         return SuccessResponse(message=f'Entity edge with UUID {uuid} deleted successfully')
     except Exception as e:
         error_msg = str(e)
+        if _is_not_found_error(e):
+            logger.warning(f'Entity edge not found for deletion: {uuid}')
+            return ErrorResponse(error=f'Entity edge with UUID {uuid} not found')
         logger.error(f'Error deleting entity edge: {error_msg}')
         return ErrorResponse(error=f'Error deleting entity edge: {error_msg}')
