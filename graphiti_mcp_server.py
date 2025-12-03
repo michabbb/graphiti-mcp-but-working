@@ -362,6 +362,14 @@ class GroupIdListResponse(TypedDict):
     group_ids: list[GroupIdResult]
 
 
+class DeleteGroupResponse(TypedDict):
+    """Response for delete_everything_by_group_id tool."""
+    message: str
+    deleted_episodes: int
+    deleted_nodes: int
+    deleted_entity_edges: int
+
+
 # Server configuration classes
 # The configuration system has a hierarchy:
 # - GraphitiConfig is the top-level configuration
@@ -867,7 +875,7 @@ Key capabilities:
 2. Search for nodes (entities) in the graph using natural language queries with search_nodes
 3. Find relevant facts (relationships between entities) with search_facts
 4. Retrieve specific entity edges or episodes by UUID
-5. Manage the knowledge graph with tools like delete_episode, delete_entity_edge, and clear_graph
+5. Manage the knowledge graph with tools like delete_episode, delete_entity_edge, delete_everything_by_group_id, and clear_graph
 
 The server connects to a database for persistent storage and uses language models for certain operations. 
 Each piece of information is organized by group_id, allowing you to maintain separate knowledge domains.
@@ -1723,6 +1731,105 @@ async def delete_episode(uuid: str) -> SuccessResponse | ErrorResponse:
         error_msg = str(e)
         logger.error(f'Error deleting episode: {error_msg}')
         return ErrorResponse(error=f'Error deleting episode: {error_msg}')
+
+
+@mcp.tool()
+async def delete_everything_by_group_id(group_id: str) -> DeleteGroupResponse | ErrorResponse:
+    """Delete all data associated with a group_id from the graph memory.
+
+    This tool completely removes all episodes, nodes, and entity edges (facts/relationships)
+    that belong to the specified group_id. After deletion, the group_id will no longer
+    appear in list_group_ids results.
+
+    This is a destructive operation that cannot be undone.
+
+    Args:
+        group_id: The group_id whose data should be completely deleted.
+    """
+    global graphiti_client
+
+    if graphiti_client is None:
+        return ErrorResponse(error='Graphiti client not initialized')
+
+    try:
+        # Validate group_id against allowlist (respects X-Group-Id header)
+        effective_group_id = get_effective_group_id(group_id, config.group_id)
+
+        if effective_group_id is None:
+            allowed = get_allowed_group_ids()
+            return ErrorResponse(
+                error=f"group_id '{group_id}' is not permitted. Allowed group_ids: {allowed}"
+            )
+
+        # We've already checked that graphiti_client is not None above
+        assert graphiti_client is not None
+
+        # Use cast to help the type checker understand that graphiti_client is not None
+        client = cast(Graphiti, graphiti_client)
+
+        # First, count all entities that will be deleted for reporting
+        count_query = """
+        OPTIONAL MATCH (episode:Episodic {group_id: $group_id})
+        WITH count(episode) AS episode_count
+        OPTIONAL MATCH (node {group_id: $group_id})
+        WHERE NOT node:Episodic
+        WITH episode_count, count(node) AS node_count
+        OPTIONAL MATCH ()-[rel {group_id: $group_id}]->()
+        RETURN episode_count, node_count, count(rel) AS edge_count
+        """
+
+        count_records, _, _ = await client.driver.execute_query(
+            count_query,
+            params={'group_id': effective_group_id}
+        )
+
+        episode_count = 0
+        node_count = 0
+        edge_count = 0
+
+        if count_records:
+            record = count_records[0]
+            episode_count = record['episode_count'] or 0
+            node_count = record['node_count'] or 0
+            edge_count = record['edge_count'] or 0
+
+        # Delete all relationships with this group_id first
+        delete_edges_query = """
+        MATCH ()-[r {group_id: $group_id}]->()
+        DELETE r
+        """
+        await client.driver.execute_query(
+            delete_edges_query,
+            params={'group_id': effective_group_id}
+        )
+
+        # Delete all nodes (including episodes) with this group_id
+        # Using DETACH DELETE to handle any remaining relationships
+        delete_nodes_query = """
+        MATCH (n {group_id: $group_id})
+        DETACH DELETE n
+        """
+        await client.driver.execute_query(
+            delete_nodes_query,
+            params={'group_id': effective_group_id}
+        )
+
+        total_deleted = episode_count + node_count + edge_count
+        logger.info(
+            f"Deleted all data for group_id '{effective_group_id}': "
+            f"{episode_count} episodes, {node_count} nodes, {edge_count} edges"
+        )
+
+        return DeleteGroupResponse(
+            message=f"Group '{effective_group_id}' completely removed ({total_deleted} total entities deleted)",
+            deleted_episodes=episode_count,
+            deleted_nodes=node_count,
+            deleted_entity_edges=edge_count
+        )
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f'Error deleting data by group_id: {error_msg}')
+        return ErrorResponse(error=f'Error deleting data by group_id: {error_msg}')
 
 
 @mcp.tool()
