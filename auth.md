@@ -6,6 +6,58 @@ This guide explains how to configure and use nonce-based authentication for the 
 
 The Graphiti MCP Server supports nonce token authentication via query parameters. This provides a simple yet secure way to authenticate requests without the complexity of OAuth flows.
 
+## ⚠️ SECURITY WARNING: Public Access Without Authentication
+
+**Starting from this version, the server will REFUSE to start** if you attempt to bind to `0.0.0.0` (all network interfaces) without proper security configuration.
+
+### Why This Matters
+
+Binding to `0.0.0.0` makes your server accessible from **any network interface**, including:
+- Your local network (LAN)
+- Potentially the public internet (if not behind a firewall)
+
+Running without authentication in this configuration would allow **anyone** to:
+- Read all data from your knowledge graph
+- Add, modify, or delete data
+- Clear your entire graph
+
+### What You Need To Do
+
+If you want to run the server publicly accessible, you **must** do ONE of the following:
+
+| Option | Environment Variable | Security Level |
+|--------|---------------------|----------------|
+| **1. Enable authentication** | `MCP_SERVER_NONCE_TOKENS=your-secret-token` | ✅ Recommended |
+| **2. Restrict allowed hosts** | `ALLOWED_HOSTS=your-domain.com` | ✅ Good |
+| **3. Explicit opt-out** | `ALLOW_UNAUTHENTICATED_PUBLIC_ACCESS=true` | ⚠️ **DANGEROUS** |
+
+### For Local Development
+
+If you only need local access, use `--host 127.0.0.1` instead of `0.0.0.0`:
+
+```bash
+python -m graphiti_mcp_server --host 127.0.0.1 --transport sse
+```
+
+This binds only to localhost and does **not** require authentication configuration.
+
+### If You Really Need Public Access Without Authentication
+
+**This is NOT RECOMMENDED**, but if you understand the risks and explicitly want to run without security:
+
+```bash
+export ALLOW_UNAUTHENTICATED_PUBLIC_ACCESS=true
+python -m graphiti_mcp_server --host 0.0.0.0 --transport sse
+```
+
+You will see these warnings in the logs:
+```
+WARNING - Host is 0.0.0.0 but ALLOWED_HOSTS not set - disabling DNS rebinding protection
+WARNING - SECURITY WARNING: Running with ALLOW_UNAUTHENTICATED_PUBLIC_ACCESS=true. Server accepts requests from ANY source without authentication!
+```
+
+---
+
 ## Prerequisites
 
 ### Dependencies

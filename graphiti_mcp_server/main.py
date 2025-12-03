@@ -210,10 +210,35 @@ async def initialize_server() -> MCPConfig:
                 allowed_origins=allowed_origins,
             )
         else:
-            # No ALLOWED_HOSTS configured - disable DNS rebinding protection
+            # No ALLOWED_HOSTS configured - check security requirements
+            # When binding to 0.0.0.0 without authentication, require explicit opt-in
+            allow_insecure = os.environ.get('ALLOW_UNAUTHENTICATED_PUBLIC_ACCESS', '').lower() == 'true'
+
+            if not ALLOWED_NONCE_TOKENS and not allow_insecure:
+                # Dangerous configuration: public binding without authentication
+                raise RuntimeError(
+                    'SECURITY ERROR: Server is configured to bind to 0.0.0.0 (all interfaces) '
+                    'without authentication (MCP_SERVER_NONCE_TOKENS not set) and without '
+                    'ALLOWED_HOSTS restriction.\n\n'
+                    'This configuration would expose your server to the public internet '
+                    'without any access control.\n\n'
+                    'To fix this, either:\n'
+                    '  1. Set MCP_SERVER_NONCE_TOKENS to enable authentication, or\n'
+                    '  2. Set ALLOWED_HOSTS to restrict access to specific hosts, or\n'
+                    '  3. Set ALLOW_UNAUTHENTICATED_PUBLIC_ACCESS=true if you explicitly '
+                    'want to run without security (NOT RECOMMENDED)\n\n'
+                    'For local development, use --host 127.0.0.1 instead of 0.0.0.0'
+                )
+
+            # User explicitly opted in or has authentication enabled
             logger.warning(
                 'Host is 0.0.0.0 but ALLOWED_HOSTS not set - disabling DNS rebinding protection'
             )
+            if not ALLOWED_NONCE_TOKENS:
+                logger.warning(
+                    'SECURITY WARNING: Running with ALLOW_UNAUTHENTICATED_PUBLIC_ACCESS=true. '
+                    'Server accepts requests from ANY source without authentication!'
+                )
             mcp.settings.transport_security = TransportSecuritySettings(
                 enable_dns_rebinding_protection=False,
             )

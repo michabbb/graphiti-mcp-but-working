@@ -128,7 +128,21 @@ The server uses the following environment variables:
 - `LLM_TEMPERATURE`: Temperature for LLM responses (0.0-2.0).
 - `CLEAR_GRAPH_PASSWORD`: Password required for the `clear_graph` tool. If not set, the `clear_graph` tool will be disabled and return an error when called.
 - `SEMAPHORE_LIMIT`: Episode processing concurrency. See [Concurrency and LLM Provider 429 Rate Limit Errors](#concurrency-and-llm-provider-429-rate-limit-errors)
-- `ALLOWED_HOSTS`: Comma-separated list of allowed hostnames for DNS rebinding protection (e.g., `graphiti.example.com,api.example.com`). Required when running on `0.0.0.0` with external access. If not set when binding to `0.0.0.0`, DNS rebinding protection will be disabled with a warning.
+- `ALLOWED_HOSTS`: Comma-separated list of allowed hostnames for DNS rebinding protection (e.g., `graphiti.example.com,api.example.com`). Required when running on `0.0.0.0` with external access.
+- `ALLOW_UNAUTHENTICATED_PUBLIC_ACCESS`: Set to `true` to allow running on `0.0.0.0` without authentication. **⚠️ DANGEROUS - See security warning below.**
+
+### ⚠️ Security Warning: Public Access
+
+**The server will REFUSE to start** if you bind to `0.0.0.0` without proper security configuration.
+
+When binding to all interfaces (`--host 0.0.0.0`), you **must** configure ONE of:
+1. `MCP_SERVER_NONCE_TOKENS` - Enable authentication (recommended)
+2. `ALLOWED_HOSTS` - Restrict to specific hostnames
+3. `ALLOW_UNAUTHENTICATED_PUBLIC_ACCESS=true` - Explicitly opt-out of security (**NOT RECOMMENDED**)
+
+For local development, use `--host 127.0.0.1` instead, which does not require security configuration.
+
+See the [Authentication Guide](auth.md) for detailed security configuration.
 
 You can set these variables in a `.env` file in the project directory.
 

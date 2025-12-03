@@ -111,6 +111,11 @@ services:
       - MCP_SERVER_NONCE_TOKENS=${MCP_SERVER_NONCE_TOKENS:-}
       # Example with tokens (DO NOT use these in production!):
       # - MCP_SERVER_NONCE_TOKENS=your-secret-token-here,another-token-here
+
+      # ⚠️ SECURITY WARNING: Only set this if you REALLY want to run without authentication!
+      # The server will REFUSE to start on 0.0.0.0 without authentication unless this is set.
+      # This exposes your server to ANYONE on the network without access control!
+      # - ALLOW_UNAUTHENTICATED_PUBLIC_ACCESS=true  # DANGEROUS - NOT RECOMMENDED
     command: ["uv", "run", "python", "-m", "graphiti_mcp_server", "--transport", "sse"]
     # Graceful shutdown: Wait up to 60 seconds for workers to complete
     stop_grace_period: 60s
